@@ -6,7 +6,9 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-green.svg)](https://www.python.org/)
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows-lightgrey.svg)]()
 
-![Murmur tray icon](docs/tray.png)
+<p align="center">
+  <img src="assets/icon-256.png" alt="Murmur tray icon — glowing gold M" width="160"/>
+</p>
 
 ## Why
 

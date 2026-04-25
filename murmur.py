@@ -419,19 +419,30 @@ class Bubble:
             self.win.withdraw()
 
 
+_ICON_PATH = Path(__file__).parent / 'assets' / 'icon.png'
+_ICON_BASE = None
+
+
+def _load_base_icon():
+    global _ICON_BASE
+    if _ICON_BASE is None and _ICON_PATH.exists():
+        _ICON_BASE = Image.open(_ICON_PATH).convert('RGBA').resize((64, 64), Image.LANCZOS)
+    return _ICON_BASE
+
+
 def make_icon_image(color):
-    img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    d.ellipse((4, 4, 60, 60), fill=color, outline='white', width=2)
-    try:
-        from PIL import ImageFont
-        font = ImageFont.truetype('arialbd.ttf', 38)
-    except Exception:
-        font = None
-    if font is not None:
-        d.text((14, 8), 'M', fill='white', font=font)
-    else:
-        d.text((20, 18), 'M', fill='white')
+    """Branded gold-M base + a small state dot in the bottom-right corner."""
+    base = _load_base_icon()
+    if base is None:
+        # Fallback if icon.png missing — flat circle with letter
+        img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.ellipse((4, 4, 60, 60), fill=color, outline='white', width=2)
+        return img
+    img = base.copy()
+    if color and color != '#5a5a5a':  # not idle — paint a state dot
+        d = ImageDraw.Draw(img)
+        d.ellipse((44, 44, 60, 60), fill=color, outline='black', width=1)
     return img
 
 
