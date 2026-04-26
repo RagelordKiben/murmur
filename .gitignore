@@ -31,3 +31,4 @@ config.local.json
 # Internal staging — not part of the published repo
 .profile_repo_seed/
 content/
+.tmp/

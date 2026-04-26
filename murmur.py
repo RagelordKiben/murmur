@@ -60,7 +60,7 @@ def log(msg):
 
 DEFAULTS = {
     'hotkey': ['ctrl', 'cmd'],
-    'model': 'small.en',
+    'model': 'medium.en',
     'compute_type': 'int8_float16',
     'device': 'cuda',
     'cleanup_enabled': True,
@@ -69,6 +69,9 @@ DEFAULTS = {
     'ollama_url': 'http://localhost:11434',
     'sample_rate': 16000,
     'max_record_sec': 90,
+    'floating_button': True,
+    'floating_x': None,   # remembered position (None = default bottom-right)
+    'floating_y': None,
 }
 
 CTRL_KEYS = {keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r}
@@ -166,12 +169,51 @@ class Recorder:
 
 
 class Transcriber:
+    """Sends audio to the shared Wyoming faster-whisper server (managed by Jarvis tray)
+    so we don't load a duplicate Whisper model into VRAM. Falls back to a local model
+    only if cfg['fallback_local'] is True AND the Wyoming server is unreachable."""
+
     def __init__(self, cfg):
         self.cfg = cfg
         self.model = None
         self._lock = threading.Lock()
+        self.wyoming_host = cfg.get('wyoming_host', '127.0.0.1')
+        self.wyoming_port = int(cfg.get('wyoming_port', 10301))
 
     def load(self):
+        # Wyoming path is connection-based, no preload. Local fallback loads on demand.
+        pass
+
+    def _wyoming_transcribe(self, audio_np):
+        import asyncio
+        from wyoming.asr import Transcribe, Transcript
+        from wyoming.audio import AudioChunk, AudioStart, AudioStop
+        from wyoming.client import AsyncTcpClient
+
+        audio_int16 = (np.clip(audio_np, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+        rate = int(self.cfg.get('sample_rate', 16000))
+
+        async def _run():
+            async with AsyncTcpClient(self.wyoming_host, self.wyoming_port) as client:
+                await client.write_event(Transcribe(language='en').event())
+                await client.write_event(AudioStart(rate=rate, width=2, channels=1).event())
+                # 1-second chunks
+                chunk_bytes = rate * 2  # 16-bit mono
+                for i in range(0, len(audio_int16), chunk_bytes):
+                    payload = audio_int16[i:i + chunk_bytes]
+                    await client.write_event(
+                        AudioChunk(rate=rate, width=2, channels=1, audio=payload).event()
+                    )
+                await client.write_event(AudioStop().event())
+                while True:
+                    event = await asyncio.wait_for(client.read_event(), timeout=30.0)
+                    if event is None:
+                        return ''
+                    if Transcript.is_type(event.type):
+                        return Transcript.from_event(event).text
+        return asyncio.run(_run())
+
+    def _local_load(self):
         with self._lock:
             if self.model is not None:
                 return
@@ -183,21 +225,28 @@ class Transcriber:
                         device='cuda',
                         compute_type=self.cfg.get('compute_type', 'int8_float16'),
                     )
-                    # probe: actually try a tiny inference so we catch cublas/cudnn issues now,
-                    # not when the user is mid-dictation
                     dummy = np.zeros(16000, dtype=np.float32)
                     segs, _ = model.transcribe(dummy, language='en', vad_filter=False, beam_size=1)
                     list(segs)
                     self.model = model
-                    log('whisper loaded on GPU')
+                    log('whisper fallback loaded on GPU')
                     return
                 except Exception as e:
-                    log(f'GPU load failed ({e}); falling back to CPU/int8')
+                    log(f'GPU fallback load failed ({e}); using CPU/int8')
             self.model = WhisperModel(self.cfg['model'], device='cpu', compute_type='int8')
-            log('whisper loaded on CPU')
+            log('whisper fallback loaded on CPU')
 
     def transcribe(self, audio, dictionary):
-        self.load()
+        # Primary path: shared Wyoming server (no local VRAM use)
+        try:
+            text = self._wyoming_transcribe(audio).strip()
+            return text
+        except Exception as e:
+            log(f'Wyoming transcribe failed: {e}')
+            if not self.cfg.get('fallback_local', False):
+                return ''
+        # Fallback path: in-process Whisper (only if explicitly enabled)
+        self._local_load()
         prompt = ', '.join(dictionary) if dictionary else None
         segments, _ = self.model.transcribe(
             audio,
@@ -377,6 +426,150 @@ def _safe_clip(value):
         pass
 
 
+class FloatingMic:
+    """Always-on-top click-to-talk mic button. Press = start recording, release = stop.
+    Mirrors the keyboard chord exactly so audio path is shared."""
+
+    SIZE = 56  # pixels
+
+    DRAG_THRESHOLD = 6  # pixels — moves above this trigger drag instead of click
+
+    def __init__(self, root, app):
+        self.root = root
+        self.app = app
+        self.win = None
+        self.canvas = None
+        self.dragging = False
+        self.press_root = (0, 0)
+        self.win_start = (0, 0)
+        self.last_state_color = None
+
+    def _ensure(self):
+        if self.win is not None:
+            return
+        self.win = tk.Toplevel(self.root)
+        self.win.overrideredirect(True)
+        self.win.attributes('-topmost', True)
+        self.win.attributes('-alpha', 0.92)
+        self.win.configure(bg='#1a1a1a')
+        # Don't steal foreground focus when clicked — paste needs to go to the
+        # window the user was typing in, not to this mic button.
+        self._apply_no_activate()
+        self.canvas = tk.Canvas(
+            self.win, width=self.SIZE, height=self.SIZE,
+            bg='#1a1a1a', highlightthickness=0, cursor='hand2',
+        )
+        self.canvas.pack()
+        self._draw('#5a5a5a')
+        # Left-click: tap to toggle record/stop, hold-and-drag to move.
+        # Right-click: hide.
+        self.canvas.bind('<ButtonPress-1>', self._on_press)
+        self.canvas.bind('<B1-Motion>', self._on_move)
+        self.canvas.bind('<ButtonRelease-1>', self._on_release)
+        self.canvas.bind('<ButtonPress-3>', lambda _e: self.hide())
+        # Restore last position or default to bottom-right
+        x = self.app.cfg.get('floating_x')
+        y = self.app.cfg.get('floating_y')
+        if x is None or y is None:
+            sw = self.win.winfo_screenwidth()
+            sh = self.win.winfo_screenheight()
+            x = sw - self.SIZE - 28
+            y = sh - self.SIZE - 90
+        self.win.geometry(f'{self.SIZE}x{self.SIZE}+{x}+{y}')
+
+    def _apply_no_activate(self):
+        if sys.platform != 'win32':
+            return
+        try:
+            import ctypes
+            GWL_EXSTYLE = -20
+            WS_EX_NOACTIVATE = 0x08000000
+            WS_EX_TOOLWINDOW = 0x00000080
+            self.win.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.win.winfo_id()) or self.win.winfo_id()
+            ex = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            ctypes.windll.user32.SetWindowLongW(
+                hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+            )
+        except Exception as e:
+            log(f'no-activate flag failed: {e}')
+
+    def _draw(self, color):
+        if not self.canvas:
+            return
+        self.last_state_color = color
+        self.canvas.delete('all')
+        s = self.SIZE
+        # Outer circle
+        self.canvas.create_oval(2, 2, s - 2, s - 2, fill=color, outline='#ffd56b', width=2)
+        # Mic glyph (rounded body + stand)
+        cx = s // 2
+        body_top = int(s * 0.28)
+        body_bot = int(s * 0.62)
+        body_w = int(s * 0.18)
+        self.canvas.create_oval(cx - body_w, body_top, cx + body_w, body_bot, fill='white', outline='')
+        # Arc under mic
+        self.canvas.create_arc(
+            int(s * 0.26), int(s * 0.42), int(s * 0.74), int(s * 0.78),
+            start=200, extent=140, style='arc', outline='white', width=2,
+        )
+        # Stand
+        self.canvas.create_line(cx, int(s * 0.72), cx, int(s * 0.82), fill='white', width=2)
+        self.canvas.create_line(int(s * 0.42), int(s * 0.82), int(s * 0.58), int(s * 0.82), fill='white', width=2)
+
+    def show(self):
+        self._ensure()
+        self.win.deiconify()
+        self.win.lift()
+
+    def hide(self):
+        if self.win:
+            self.win.withdraw()
+
+    def set_state_color(self, color):
+        if self.win and self.canvas:
+            self._draw(color)
+
+    def _on_press(self, ev):
+        self.press_root = (ev.x_root, ev.y_root)
+        self.win_start = (self.win.winfo_x(), self.win.winfo_y())
+        self.dragging = False
+
+    def _on_move(self, ev):
+        dx = ev.x_root - self.press_root[0]
+        dy = ev.y_root - self.press_root[1]
+        if not self.dragging and (abs(dx) + abs(dy) > self.DRAG_THRESHOLD):
+            self.dragging = True
+        if self.dragging:
+            nx = self.win_start[0] + dx
+            ny = self.win_start[1] + dy
+            self.win.geometry(f'{self.SIZE}x{self.SIZE}+{nx}+{ny}')
+
+    def _on_release(self, _ev):
+        if self.dragging:
+            # Was a drag — persist new position, no recording
+            try:
+                self.app.cfg['floating_x'] = self.win.winfo_x()
+                self.app.cfg['floating_y'] = self.win.winfo_y()
+                save_config(self.app.cfg)
+            except Exception as e:
+                log(f'failed saving floating position: {e}')
+            self.dragging = False
+            return
+        # Was a click — toggle record/stop
+        if self.app.state == 'idle':
+            self.app.set_state('listening')
+            try:
+                self.app.recorder.start()
+            except Exception as e:
+                print(f'[murmur] recorder start failed: {e}', file=sys.stderr)
+                self.app.set_state('idle')
+        elif self.app.state == 'listening':
+            audio = self.app.recorder.stop()
+            self.app.set_state('processing')
+            threading.Thread(target=self.app._process, args=(audio,), daemon=True).start()
+
+
 class Bubble:
     def __init__(self, root):
         self.root = root
@@ -466,6 +659,9 @@ class MurmurApp:
         self.tk_root = tk.Tk()
         self.tk_root.withdraw()
         self.bubble = Bubble(self.tk_root)
+        self.floating_mic = FloatingMic(self.tk_root, self) if self.cfg.get('floating_button', True) else None
+        if self.floating_mic:
+            self.tk_root.after(100, self.floating_mic.show)
 
         self.hotkey_groups = self._parse_hotkey(self.cfg['hotkey'])
         self.keys_down = {name: False for name in self.hotkey_groups}
@@ -475,6 +671,11 @@ class MurmurApp:
             make_icon_image(STATE_VISUAL['idle'][0]),
             title='Murmur — Idle',
             menu=Menu(
+                MenuItem(
+                    'Show Floating Button',
+                    self._menu_toggle_floating,
+                    checked=lambda _i: self._floating_visible(),
+                ),
                 MenuItem('Settings', self._menu_settings),
                 MenuItem('Edit Dictionary', self._menu_dictionary),
                 MenuItem('Stats', self._menu_stats),
@@ -533,6 +734,8 @@ class MurmurApp:
             self.tk_root.after(0, lambda: self.bubble.show(bubble_text, bubble_bg))
         else:
             self.tk_root.after(0, self.bubble.hide)
+        if self.floating_mic:
+            self.tk_root.after(0, lambda c=color: self.floating_mic.set_state_color(c))
 
     def on_press(self, key):
         group = self._which_group(key)
@@ -601,6 +804,21 @@ class MurmurApp:
         self.stats['sessions'] = self.stats.get('sessions', 0) + 1
         self.stats['last_session'] = time.strftime('%Y-%m-%d %H:%M:%S')
         save_stats(self.stats)
+
+    def _floating_visible(self):
+        return bool(self.floating_mic and self.floating_mic.win and self.floating_mic.win.winfo_viewable())
+
+    def _menu_toggle_floating(self, icon, item):
+        # Lazily create the floating mic if it was disabled at startup
+        if self.floating_mic is None:
+            self.floating_mic = FloatingMic(self.tk_root, self)
+        if self._floating_visible():
+            self.tk_root.after(0, self.floating_mic.hide)
+            self.cfg['floating_button'] = False
+        else:
+            self.tk_root.after(0, self.floating_mic.show)
+            self.cfg['floating_button'] = True
+        save_config(self.cfg)
 
     def _menu_settings(self, icon, item):
         from settings_ui import open_settings_window
