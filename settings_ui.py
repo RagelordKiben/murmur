@@ -10,8 +10,11 @@ HOTKEY_PRESETS = {
     'Ctrl + Win + Alt': ['ctrl', 'cmd', 'alt'],
 }
 
-MODEL_OPTIONS = ['tiny.en', 'base.en', 'small.en', 'medium.en', 'large-v3']
+MODEL_OPTIONS = ['tiny.en', 'base.en', 'small.en', 'medium.en', 'large-v3-turbo', 'large-v3']
 DEVICE_OPTIONS = ['cuda', 'cpu']
+# Whisper language: ISO code or 'auto' to detect per-utterance.
+# Note: '.en' models are English-only — use large-v3-turbo / large-v3 for other languages.
+LANGUAGE_OPTIONS = ['en', 'vi', 'auto']
 BACKEND_OPTIONS = ['ollama', 'claude']
 OLLAMA_MODEL_SUGGESTIONS = [
     'qwen2.5:3b',
@@ -53,6 +56,10 @@ def open_settings_window(root, cfg, on_save):
     device_var = tk.StringVar(value=cfg.get('device', 'cuda'))
     ttk.Combobox(win, textvariable=device_var, values=DEVICE_OPTIONS, state='readonly', width=30).grid(row=2, column=1, **pad)
 
+    tk.Label(win, text='Language:', **label_args).grid(row=3, column=0, sticky='w', **pad)
+    lang_var = tk.StringVar(value=cfg.get('language', 'en'))
+    ttk.Combobox(win, textvariable=lang_var, values=LANGUAGE_OPTIONS, width=30).grid(row=3, column=1, **pad)
+
     cleanup_var = tk.BooleanVar(value=cfg.get('cleanup_enabled', True))
     tk.Checkbutton(
         win,
@@ -61,16 +68,16 @@ def open_settings_window(root, cfg, on_save):
         bg='#1e1e1e', fg='#ddd', selectcolor='#1e1e1e',
         activebackground='#1e1e1e', activeforeground='#fff',
         font=('Segoe UI', 10),
-    ).grid(row=3, column=0, columnspan=2, sticky='w', **pad)
+    ).grid(row=4, column=0, columnspan=2, sticky='w', **pad)
 
-    tk.Label(win, text='Cleanup backend:', **label_args).grid(row=4, column=0, sticky='w', **pad)
+    tk.Label(win, text='Cleanup backend:', **label_args).grid(row=5, column=0, sticky='w', **pad)
     backend_var = tk.StringVar(value=cfg.get('cleanup_backend', 'ollama'))
-    ttk.Combobox(win, textvariable=backend_var, values=BACKEND_OPTIONS, state='readonly', width=30).grid(row=4, column=1, **pad)
+    ttk.Combobox(win, textvariable=backend_var, values=BACKEND_OPTIONS, state='readonly', width=30).grid(row=5, column=1, **pad)
 
-    tk.Label(win, text='Cleanup model:', **label_args).grid(row=5, column=0, sticky='w', **pad)
+    tk.Label(win, text='Cleanup model:', **label_args).grid(row=6, column=0, sticky='w', **pad)
     cm_var = tk.StringVar(value=cfg.get('cleanup_model', 'qwen2.5:7b'))
     cm_combo = ttk.Combobox(win, textvariable=cm_var, values=OLLAMA_MODEL_SUGGESTIONS, width=30)
-    cm_combo.grid(row=5, column=1, **pad)
+    cm_combo.grid(row=6, column=1, **pad)
 
     def on_backend_change(*_):
         if backend_var.get() == 'claude':
@@ -90,18 +97,20 @@ def open_settings_window(root, cfg, on_save):
         win,
         text=(
             'ollama  →  fast, free, local, no quota.  Best for high-frequency dictation.\n'
-            'claude  →  uses your Max plan window. Higher quality, slower (~7-15s).'
+            'claude  →  uses your Max plan window. Higher quality, slower (~7-15s).\n'
+            "language: '.en' Whisper models are English-only — for vi/auto use large-v3-turbo."
         ),
         bg='#1e1e1e', fg='#888', font=('Segoe UI', 9, 'italic'),
         justify='left',
     )
-    note.grid(row=6, column=0, columnspan=2, sticky='w', padx=14, pady=(12, 4))
+    note.grid(row=7, column=0, columnspan=2, sticky='w', padx=14, pady=(12, 4))
 
     def save():
         new_cfg = dict(cfg)
         new_cfg['hotkey'] = HOTKEY_PRESETS[hotkey_var.get()]
         new_cfg['model'] = model_var.get()
         new_cfg['device'] = device_var.get()
+        new_cfg['language'] = lang_var.get().strip() or 'en'
         new_cfg['compute_type'] = 'int8_float16' if device_var.get() == 'cuda' else 'int8'
         new_cfg['cleanup_enabled'] = cleanup_var.get()
         new_cfg['cleanup_backend'] = backend_var.get()

@@ -14,11 +14,15 @@ import threading
 import subprocess
 from pathlib import Path
 
-# Add Ollama's bundled CUDA DLLs to the search path so faster-whisper can use the GPU
-# even when CUDA toolkit isn't separately installed. Must happen BEFORE faster_whisper
-# is imported, and must update PATH (not just add_dll_directory) for ctranslate2's loader.
+# Add CUDA DLLs to the search path so faster-whisper can use the GPU even when the
+# CUDA toolkit isn't separately installed. Must happen BEFORE faster_whisper is
+# imported, and must update PATH (not just add_dll_directory) for ctranslate2's loader.
+# Primary source: the nvidia-* pip packages in this venv (cuBLAS + cuDNN + NVRTC).
+# Ollama's bundled libs are kept as a secondary source (cuBLAS only — no cuDNN there).
 if sys.platform == 'win32':
-    _cuda_dirs = [
+    _nvidia_root = Path(sys.prefix) / 'Lib' / 'site-packages' / 'nvidia'
+    _cuda_dirs = sorted(_nvidia_root.glob('*/bin')) if _nvidia_root.exists() else []
+    _cuda_dirs += [
         Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'Ollama' / 'lib' / 'ollama' / 'cuda_v12',
         Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'Ollama' / 'lib' / 'ollama',
     ]
@@ -60,9 +64,10 @@ def log(msg):
 
 DEFAULTS = {
     'hotkey': ['ctrl', 'cmd'],
-    'model': 'medium.en',
+    'model': 'large-v3-turbo',
     'compute_type': 'int8_float16',
     'device': 'cuda',
+    'language': 'en',   # ISO code ('en', 'vi', ...) or 'auto' to detect per-utterance
     'cleanup_enabled': True,
     'cleanup_backend': 'ollama',     # 'ollama' (fast/free) or 'claude' (heavier)
     'cleanup_model': 'qwen2.5:7b',   # ollama model tag, or claude alias if backend=claude
@@ -169,55 +174,20 @@ class Recorder:
 
 
 class Transcriber:
-    """Sends audio to the shared Wyoming faster-whisper server (managed by Jarvis tray)
-    so we don't load a duplicate Whisper model into VRAM. Falls back to a local model
-    only if cfg['fallback_local'] is True AND the Wyoming server is unreachable."""
+    """In-process faster-whisper: loads on GPU when available, falls back to CPU/int8.
+    Model is preloaded (and CUDA kernels warmed) at startup so the first dictation
+    doesn't pay the cold-start cost."""
 
     def __init__(self, cfg):
         self.cfg = cfg
         self.model = None
         self._lock = threading.Lock()
-        self.wyoming_host = cfg.get('wyoming_host', '127.0.0.1')
-        self.wyoming_port = int(cfg.get('wyoming_port', 10301))
 
     def load(self):
-        # Wyoming path is connection-based, no preload. Local fallback loads on demand.
-        pass
-
-    def _wyoming_transcribe(self, audio_np):
-        import asyncio
-        from wyoming.asr import Transcribe, Transcript
-        from wyoming.audio import AudioChunk, AudioStart, AudioStop
-        from wyoming.client import AsyncTcpClient
-
-        audio_int16 = (np.clip(audio_np, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-        rate = int(self.cfg.get('sample_rate', 16000))
-
-        async def _run():
-            async with AsyncTcpClient(self.wyoming_host, self.wyoming_port) as client:
-                await client.write_event(Transcribe(language='en').event())
-                await client.write_event(AudioStart(rate=rate, width=2, channels=1).event())
-                # 1-second chunks
-                chunk_bytes = rate * 2  # 16-bit mono
-                for i in range(0, len(audio_int16), chunk_bytes):
-                    payload = audio_int16[i:i + chunk_bytes]
-                    await client.write_event(
-                        AudioChunk(rate=rate, width=2, channels=1, audio=payload).event()
-                    )
-                await client.write_event(AudioStop().event())
-                while True:
-                    event = await asyncio.wait_for(client.read_event(), timeout=30.0)
-                    if event is None:
-                        return ''
-                    if Transcript.is_type(event.type):
-                        return Transcript.from_event(event).text
-        return asyncio.run(_run())
-
-    def _local_load(self):
         with self._lock:
             if self.model is not None:
                 return
-            requested_device = self.cfg.get('device', 'cpu')
+            requested_device = self.cfg.get('device', 'cuda')
             if requested_device == 'cuda':
                 try:
                     model = WhisperModel(
@@ -225,32 +195,25 @@ class Transcriber:
                         device='cuda',
                         compute_type=self.cfg.get('compute_type', 'int8_float16'),
                     )
+                    # Warm-up pass forces CUDA kernel/cuDNN load now, not mid-dictation
                     dummy = np.zeros(16000, dtype=np.float32)
                     segs, _ = model.transcribe(dummy, language='en', vad_filter=False, beam_size=1)
                     list(segs)
                     self.model = model
-                    log('whisper fallback loaded on GPU')
+                    log('whisper loaded on GPU')
                     return
                 except Exception as e:
-                    log(f'GPU fallback load failed ({e}); using CPU/int8')
+                    log(f'GPU load failed ({e}); using CPU/int8')
             self.model = WhisperModel(self.cfg['model'], device='cpu', compute_type='int8')
-            log('whisper fallback loaded on CPU')
+            log('whisper loaded on CPU')
 
     def transcribe(self, audio, dictionary):
-        # Primary path: shared Wyoming server (no local VRAM use)
-        try:
-            text = self._wyoming_transcribe(audio).strip()
-            return text
-        except Exception as e:
-            log(f'Wyoming transcribe failed: {e}')
-            if not self.cfg.get('fallback_local', False):
-                return ''
-        # Fallback path: in-process Whisper (only if explicitly enabled)
-        self._local_load()
+        self.load()  # no-op once loaded
         prompt = ', '.join(dictionary) if dictionary else None
+        lang = self.cfg.get('language', 'en')
         segments, _ = self.model.transcribe(
             audio,
-            language='en',
+            language=None if lang == 'auto' else lang,
             initial_prompt=prompt,
             vad_filter=True,
         )
@@ -308,6 +271,7 @@ def clean_with_ollama(text, dictionary, model, url):
         'model': model,
         'prompt': prompt,
         'stream': False,
+        'keep_alive': '30m',  # stay resident between dictations — avoids ~40s cold reload
         'options': {
             'temperature': 0.1,
             'num_predict': 512,

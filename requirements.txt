@@ -1,4 +1,7 @@
 faster-whisper>=1.0.0
+# GPU support for ctranslate2/faster-whisper (cuBLAS + cuDNN 9); harmless on CPU-only boxes
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
 sounddevice>=0.4.6
 numpy>=1.24
 pyperclip>=1.8.2
