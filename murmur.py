@@ -12,6 +12,7 @@ import sys
 import time
 import threading
 import subprocess
+from collections import deque
 from pathlib import Path
 
 # Add CUDA DLLs to the search path so faster-whisper can use the GPU even when the
@@ -143,10 +144,12 @@ class Recorder:
         self.frames = []
         self.stream = None
         self.recording = False
+        self.level = 0.0  # rolling RMS of the latest chunk — drives the waveform UI
 
     def _callback(self, indata, frames, time_info, status):
         if self.recording:
             self.frames.append(indata.copy())
+            self.level = float(np.sqrt(np.mean(indata ** 2)))
 
     def start(self):
         self.frames = []
@@ -590,10 +593,23 @@ class FloatingMic:
 
 
 class Bubble:
-    def __init__(self, root):
+    """Wispr-style floating status box, bottom-center of the screen.
+    Listening: a live waveform animated from the recorder's mic level.
+    Processing: static text. Idle: hidden."""
+
+    BARS = 26
+    W = 230
+    H = 46
+    TICK_MS = 50  # waveform refresh — one new bar every tick, scrolls right-to-left
+
+    def __init__(self, root, app=None):
         self.root = root
+        self.app = app
         self.win = None
-        self.label = None
+        self.canvas = None
+        self._levels = None
+        self._anim_job = None
+        self._mode = None
 
     def _ensure(self):
         if self.win is not None:
@@ -602,31 +618,75 @@ class Bubble:
         self.win.overrideredirect(True)
         self.win.attributes('-topmost', True)
         self.win.attributes('-alpha', 0.92)
-        self.label = tk.Label(
-            self.win,
-            text='',
-            font=('Segoe UI', 11, 'bold'),
-            fg='white',
-            bg='#202020',
-            padx=16,
-            pady=8,
+        self.win.configure(bg='#202020')
+        self.canvas = tk.Canvas(
+            self.win, width=self.W, height=self.H,
+            bg='#202020', highlightthickness=0,
         )
-        self.label.pack()
+        self.canvas.pack()
         self.win.withdraw()
 
-    def show(self, text, color='#202020'):
-        self._ensure()
-        self.label.config(text=text, bg=color)
-        self.win.configure(bg=color)
+    def _place(self):
         self.win.update_idletasks()
         sw = self.win.winfo_screenwidth()
         sh = self.win.winfo_screenheight()
-        w = self.win.winfo_width()
-        self.win.geometry(f'+{(sw - w) // 2}+{sh - 140}')
+        self.win.geometry(f'+{(sw - self.W) // 2}+{sh - 140}')
+
+    def _stop_anim(self):
+        if self._anim_job is not None:
+            try:
+                self.win.after_cancel(self._anim_job)
+            except Exception:
+                pass
+            self._anim_job = None
+
+    def show_wave(self):
+        """Animated waveform while recording — the 'it hears you' signal."""
+        self._ensure()
+        self._stop_anim()
+        self._mode = 'wave'
+        self._levels = deque([0.0] * self.BARS, maxlen=self.BARS)
+        self.win.configure(bg='#202020')
+        self.canvas.configure(bg='#202020')
+        self._place()
+        self.win.deiconify()
+        self.win.lift()
+        self._tick()
+
+    def _tick(self):
+        if self._mode != 'wave':
+            return
+        raw = self.app.recorder.level if (self.app and self.app.recorder) else 0.0
+        # Speech RMS is roughly 0.02–0.3; scale into 0..1 with a floor so the
+        # bar strip stays visible (and clearly "waiting") during silence.
+        self._levels.append(min(1.0, raw * 8.0))
+        c = self.canvas
+        c.delete('all')
+        bw = self.W / self.BARS
+        mid = self.H / 2
+        for i, lv in enumerate(self._levels):
+            h = max(3.0, lv * (self.H - 10))
+            x = i * bw + bw * 0.25
+            c.create_rectangle(x, mid - h / 2, x + bw * 0.5, mid + h / 2,
+                               fill='#e64545', outline='')
+        self._anim_job = self.win.after(self.TICK_MS, self._tick)
+
+    def show(self, text, color='#202020'):
+        self._ensure()
+        self._stop_anim()
+        self._mode = 'text'
+        self.win.configure(bg=color)
+        self.canvas.configure(bg=color)
+        self.canvas.delete('all')
+        self.canvas.create_text(self.W / 2, self.H / 2, text=text, fill='white',
+                                font=('Segoe UI', 11, 'bold'))
+        self._place()
         self.win.deiconify()
         self.win.lift()
 
     def hide(self):
+        self._stop_anim()
+        self._mode = None
         if self.win:
             self.win.withdraw()
 
@@ -677,7 +737,7 @@ class MurmurApp:
 
         self.tk_root = tk.Tk()
         self.tk_root.withdraw()
-        self.bubble = Bubble(self.tk_root)
+        self.bubble = Bubble(self.tk_root, self)
         self.floating_mic = FloatingMic(self.tk_root, self) if self.cfg.get('floating_button', True) else None
         if self.floating_mic:
             self.tk_root.after(100, self.floating_mic.show)
@@ -749,7 +809,9 @@ class MurmurApp:
         color, bubble_text, bubble_bg = STATE_VISUAL[state]
         self.icon.icon = make_icon_image(color)
         self.icon.title = f'Murmur — {state.capitalize()}'
-        if bubble_text:
+        if state == 'listening':
+            self.tk_root.after(0, self.bubble.show_wave)
+        elif bubble_text:
             self.tk_root.after(0, lambda: self.bubble.show(bubble_text, bubble_bg))
         else:
             self.tk_root.after(0, self.bubble.hide)
