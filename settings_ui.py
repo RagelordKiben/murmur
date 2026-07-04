@@ -10,6 +10,27 @@ HOTKEY_PRESETS = {
     'Ctrl + Win + Alt': ['ctrl', 'cmd', 'alt'],
 }
 
+# Continuous-mode toggle chord — includes an "Off" choice, and avoids reusing the
+# push-to-talk default so the two don't collide.
+TOGGLE_PRESETS = {
+    'Off (disabled)': [],
+    'Ctrl + Alt': ['ctrl', 'alt'],
+    'Ctrl + Shift': ['ctrl', 'shift'],
+    'Alt + Shift': ['alt', 'shift'],
+    'Ctrl + Win + Shift': ['ctrl', 'cmd', 'shift'],
+}
+
+# Bubble default start location. 'custom' means "wherever I last dragged it".
+POSITION_LABELS = {
+    'bottom-center': 'Bottom center',
+    'bottom-right': 'Bottom right',
+    'bottom-left': 'Bottom left',
+    'top-center': 'Top center',
+    'top-right': 'Top right',
+    'top-left': 'Top left',
+    'custom': 'Custom (last dragged)',
+}
+
 MODEL_OPTIONS = ['tiny.en', 'base.en', 'small.en', 'medium.en', 'large-v3-turbo', 'large-v3']
 DEVICE_OPTIONS = ['cuda', 'cpu']
 # Whisper language: ISO code or 'auto' to detect per-utterance.
@@ -26,15 +47,15 @@ OLLAMA_MODEL_SUGGESTIONS = [
 CLAUDE_MODEL_OPTIONS = ['haiku', 'sonnet', 'opus']
 
 
-def _match_preset(spec):
-    spec_set = set(spec)
-    for label, preset in HOTKEY_PRESETS.items():
+def _match_preset(spec, presets=HOTKEY_PRESETS):
+    spec_set = set(spec or [])
+    for label, preset in presets.items():
         if set(preset) == spec_set:
             return label
-    return list(HOTKEY_PRESETS.keys())[0]
+    return list(presets.keys())[0]
 
 
-def _animate_expand(win, origin, final, steps=14, interval=12):
+def _animate_expand(win, origin, final, steps=18, interval=10):
     """Grow a window from the origin rect to the final rect (ease-out cubic)."""
     ox, oy, ow, oh = origin
     fx, fy, fw, fh = final
@@ -59,7 +80,7 @@ def _animate_expand(win, origin, final, steps=14, interval=12):
 def open_settings_window(root, cfg, on_save, origin=None):
     """origin: optional (x, y, w, h) rect to animate the window out of —
     used when opened by double-clicking the status bubble."""
-    WIN_W, WIN_H = 500, 520
+    WIN_W, WIN_H = 520, 660
     win = tk.Toplevel(root)
     win.title('Murmur —Settings')
     win.attributes('-topmost', True)
@@ -77,23 +98,33 @@ def open_settings_window(root, cfg, on_save, origin=None):
         win.geometry(f'{WIN_W}x{WIN_H}')
 
     label_args = {'bg': '#1e1e1e', 'fg': '#ddd', 'font': ('Segoe UI', 10), 'anchor': 'w'}
-    pad = {'padx': 14, 'pady': 5}
+    head_args = {'bg': '#1e1e1e', 'fg': '#ffd56b', 'font': ('Segoe UI', 10, 'bold'), 'anchor': 'w'}
+    pad = {'padx': 14, 'pady': 4}
+    r = 0
 
-    tk.Label(win, text='Hotkey (hold to dictate):', **label_args).grid(row=0, column=0, sticky='w', **pad)
-    hotkey_var = tk.StringVar(value=_match_preset(cfg.get('hotkey', ['ctrl', 'cmd'])))
-    ttk.Combobox(win, textvariable=hotkey_var, values=list(HOTKEY_PRESETS.keys()), state='readonly', width=30).grid(row=0, column=1, **pad)
+    tk.Label(win, text='Hotkeys', **head_args).grid(row=r, column=0, columnspan=2, sticky='w', padx=14, pady=(12, 2)); r += 1
 
-    tk.Label(win, text='Whisper model:', **label_args).grid(row=1, column=0, sticky='w', **pad)
+    tk.Label(win, text='Push-to-talk (hold to dictate):', **label_args).grid(row=r, column=0, sticky='w', **pad)
+    hotkey_var = tk.StringVar(value=_match_preset(cfg.get('hotkey', ['ctrl', 'cmd']), HOTKEY_PRESETS))
+    ttk.Combobox(win, textvariable=hotkey_var, values=list(HOTKEY_PRESETS.keys()), state='readonly', width=30).grid(row=r, column=1, **pad); r += 1
+
+    tk.Label(win, text='Continuous transcription (tap to toggle):', **label_args).grid(row=r, column=0, sticky='w', **pad)
+    toggle_var = tk.StringVar(value=_match_preset(cfg.get('toggle_hotkey', []), TOGGLE_PRESETS))
+    ttk.Combobox(win, textvariable=toggle_var, values=list(TOGGLE_PRESETS.keys()), state='readonly', width=30).grid(row=r, column=1, **pad); r += 1
+
+    tk.Label(win, text='Transcription', **head_args).grid(row=r, column=0, columnspan=2, sticky='w', padx=14, pady=(12, 2)); r += 1
+
+    tk.Label(win, text='Whisper model:', **label_args).grid(row=r, column=0, sticky='w', **pad)
     model_var = tk.StringVar(value=cfg.get('model', 'small.en'))
-    ttk.Combobox(win, textvariable=model_var, values=MODEL_OPTIONS, state='readonly', width=30).grid(row=1, column=1, **pad)
+    ttk.Combobox(win, textvariable=model_var, values=MODEL_OPTIONS, state='readonly', width=30).grid(row=r, column=1, **pad); r += 1
 
-    tk.Label(win, text='Whisper device:', **label_args).grid(row=2, column=0, sticky='w', **pad)
+    tk.Label(win, text='Whisper device:', **label_args).grid(row=r, column=0, sticky='w', **pad)
     device_var = tk.StringVar(value=cfg.get('device', 'cuda'))
-    ttk.Combobox(win, textvariable=device_var, values=DEVICE_OPTIONS, state='readonly', width=30).grid(row=2, column=1, **pad)
+    ttk.Combobox(win, textvariable=device_var, values=DEVICE_OPTIONS, state='readonly', width=30).grid(row=r, column=1, **pad); r += 1
 
-    tk.Label(win, text='Language:', **label_args).grid(row=3, column=0, sticky='w', **pad)
+    tk.Label(win, text='Language:', **label_args).grid(row=r, column=0, sticky='w', **pad)
     lang_var = tk.StringVar(value=cfg.get('language', 'en'))
-    ttk.Combobox(win, textvariable=lang_var, values=LANGUAGE_OPTIONS, width=30).grid(row=3, column=1, **pad)
+    ttk.Combobox(win, textvariable=lang_var, values=LANGUAGE_OPTIONS, width=30).grid(row=r, column=1, **pad); r += 1
 
     cleanup_var = tk.BooleanVar(value=cfg.get('cleanup_enabled', True))
     tk.Checkbutton(
@@ -103,16 +134,16 @@ def open_settings_window(root, cfg, on_save, origin=None):
         bg='#1e1e1e', fg='#ddd', selectcolor='#1e1e1e',
         activebackground='#1e1e1e', activeforeground='#fff',
         font=('Segoe UI', 10),
-    ).grid(row=4, column=0, columnspan=2, sticky='w', **pad)
+    ).grid(row=r, column=0, columnspan=2, sticky='w', **pad); r += 1
 
-    tk.Label(win, text='Cleanup backend:', **label_args).grid(row=5, column=0, sticky='w', **pad)
+    tk.Label(win, text='Cleanup backend:', **label_args).grid(row=r, column=0, sticky='w', **pad)
     backend_var = tk.StringVar(value=cfg.get('cleanup_backend', 'ollama'))
-    ttk.Combobox(win, textvariable=backend_var, values=BACKEND_OPTIONS, state='readonly', width=30).grid(row=5, column=1, **pad)
+    ttk.Combobox(win, textvariable=backend_var, values=BACKEND_OPTIONS, state='readonly', width=30).grid(row=r, column=1, **pad); r += 1
 
-    tk.Label(win, text='Cleanup model:', **label_args).grid(row=6, column=0, sticky='w', **pad)
+    tk.Label(win, text='Cleanup model:', **label_args).grid(row=r, column=0, sticky='w', **pad)
     cm_var = tk.StringVar(value=cfg.get('cleanup_model', 'qwen2.5:7b'))
     cm_combo = ttk.Combobox(win, textvariable=cm_var, values=OLLAMA_MODEL_SUGGESTIONS, width=30)
-    cm_combo.grid(row=6, column=1, **pad)
+    cm_combo.grid(row=r, column=1, **pad); r += 1
 
     def on_backend_change(*_):
         if backend_var.get() == 'claude':
@@ -128,21 +159,41 @@ def open_settings_window(root, cfg, on_save, origin=None):
     backend_var.trace_add('write', on_backend_change)
     on_backend_change()
 
+    tk.Label(win, text='Status bubble', **head_args).grid(row=r, column=0, columnspan=2, sticky='w', padx=14, pady=(12, 2)); r += 1
+
+    bubble_visible_var = tk.BooleanVar(value=cfg.get('bubble_visible', True))
+    tk.Checkbutton(
+        win,
+        text='Always show status bubble',
+        variable=bubble_visible_var,
+        bg='#1e1e1e', fg='#ddd', selectcolor='#1e1e1e',
+        activebackground='#1e1e1e', activeforeground='#fff',
+        font=('Segoe UI', 10),
+    ).grid(row=r, column=0, columnspan=2, sticky='w', **pad); r += 1
+
+    tk.Label(win, text='Default location:', **label_args).grid(row=r, column=0, sticky='w', **pad)
+    pos_var = tk.StringVar(value=POSITION_LABELS.get(cfg.get('bubble_position', 'bottom-center'), 'Bottom center'))
+    ttk.Combobox(win, textvariable=pos_var, values=list(POSITION_LABELS.values()), state='readonly', width=30).grid(row=r, column=1, **pad); r += 1
+
     note = tk.Label(
         win,
         text=(
             'ollama  →  fast, free, local, no quota.  Best for high-frequency dictation.\n'
             'claude  →  uses your Max plan window. Higher quality, slower (~7-15s).\n'
-            "language: '.en' Whisper models are English-only — for vi/auto use large-v3-turbo."
+            "language: '.en' models are English-only — for vi/auto use large-v3-turbo.\n"
+            'Tip: drag the bubble to reposition; double-click it to open settings.'
         ),
         bg='#1e1e1e', fg='#888', font=('Segoe UI', 9, 'italic'),
         justify='left',
     )
-    note.grid(row=7, column=0, columnspan=2, sticky='w', padx=14, pady=(12, 4))
+    note.grid(row=r, column=0, columnspan=2, sticky='w', padx=14, pady=(10, 4)); r += 1
+
+    label_to_pos = {v: k for k, v in POSITION_LABELS.items()}
 
     def save():
         new_cfg = dict(cfg)
         new_cfg['hotkey'] = HOTKEY_PRESETS[hotkey_var.get()]
+        new_cfg['toggle_hotkey'] = TOGGLE_PRESETS[toggle_var.get()]
         new_cfg['model'] = model_var.get()
         new_cfg['device'] = device_var.get()
         new_cfg['language'] = lang_var.get().strip() or 'en'
@@ -150,11 +201,13 @@ def open_settings_window(root, cfg, on_save, origin=None):
         new_cfg['cleanup_enabled'] = cleanup_var.get()
         new_cfg['cleanup_backend'] = backend_var.get()
         new_cfg['cleanup_model'] = cm_var.get()
+        new_cfg['bubble_visible'] = bubble_visible_var.get()
+        new_cfg['bubble_position'] = label_to_pos.get(pos_var.get(), 'bottom-center')
         on_save(new_cfg)
         messagebox.showinfo('Murmur', 'Settings saved. Restart Murmur if Whisper model or device changed.')
         win.destroy()
 
-    tk.Button(win, text='Save', command=save, width=14, bg='#3a8a3a', fg='white', font=('Segoe UI', 10, 'bold'), relief='flat', padx=8, pady=4).grid(row=10, column=0, columnspan=2, pady=18)
+    tk.Button(win, text='Save', command=save, width=14, bg='#3a8a3a', fg='white', font=('Segoe UI', 10, 'bold'), relief='flat', padx=8, pady=4).grid(row=r, column=0, columnspan=2, pady=16)
 
 
 def open_dictionary_window(root, dict_path):

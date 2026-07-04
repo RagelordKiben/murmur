@@ -64,7 +64,8 @@ def log(msg):
     print(f'[{time.strftime("%H:%M:%S")}] {msg}', flush=True)
 
 DEFAULTS = {
-    'hotkey': ['ctrl', 'cmd'],
+    'hotkey': ['ctrl', 'cmd'],          # push-to-talk: hold to dictate
+    'toggle_hotkey': ['ctrl', 'alt'],   # tap to start/stop hands-free continuous mode ([] = off)
     'model': 'large-v3-turbo',
     'compute_type': 'int8_float16',
     'device': 'cuda',
@@ -79,7 +80,8 @@ DEFAULTS = {
     'floating_x': None,   # remembered position (None = default bottom-right)
     'floating_y': None,
     'bubble_visible': True,
-    'bubble_x': None,     # remembered position (None = default bottom-center)
+    'bubble_position': 'bottom-center',  # anchor, or 'custom' when dragged
+    'bubble_x': None,     # remembered position when bubble_position == 'custom'
     'bubble_y': None,
 }
 
@@ -652,16 +654,37 @@ class Bubble:
         self.canvas.bind('<ButtonPress-3>', lambda _e: self._hide_forever())
         self.win.withdraw()
 
-    def _place(self):
+    def _anchor_xy(self, pos):
         self.win.update_idletasks()
-        x = self.app.cfg.get('bubble_x') if self.app else None
-        y = self.app.cfg.get('bubble_y') if self.app else None
-        if x is None or y is None:
-            sw = self.win.winfo_screenwidth()
-            sh = self.win.winfo_screenheight()
-            x = (sw - self.W) // 2
-            y = sh - 140
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        m = 28
+        top, bot = m + 8, sh - 140
+        anchors = {
+            'bottom-center': ((sw - self.W) // 2, bot),
+            'bottom-right': (sw - self.W - m, bot),
+            'bottom-left': (m, bot),
+            'top-center': ((sw - self.W) // 2, top),
+            'top-right': (sw - self.W - m, top),
+            'top-left': (m, top),
+        }
+        return anchors.get(pos, anchors['bottom-center'])
+
+    def _place(self):
+        pos = self.app.cfg.get('bubble_position', 'bottom-center') if self.app else 'bottom-center'
+        if pos == 'custom' and self.app:
+            x = self.app.cfg.get('bubble_x')
+            y = self.app.cfg.get('bubble_y')
+            if x is None or y is None:
+                x, y = self._anchor_xy('bottom-center')
+        else:
+            x, y = self._anchor_xy(pos)
         self.win.geometry(f'{self.W}x{self.H}+{x}+{y}')
+
+    def reposition(self):
+        """Re-apply placement from config (e.g. after the position setting changes)."""
+        if self.win and self.enabled:
+            self._place()
 
     def _stop_anim(self):
         if self._anim_job is not None:
@@ -694,6 +717,7 @@ class Bubble:
         self.dragging = False
         if self.app:
             try:
+                self.app.cfg['bubble_position'] = 'custom'
                 self.app.cfg['bubble_x'] = self.win.winfo_x()
                 self.app.cfg['bubble_y'] = self.win.winfo_y()
                 save_config(self.app.cfg)
@@ -847,8 +871,14 @@ class MurmurApp:
             self.tk_root.after(100, self.floating_mic.show)
         self.tk_root.after(150, self.bubble.show_idle)  # persistent pill (no-op if hidden)
 
-        self.hotkey_groups = self._parse_hotkey(self.cfg['hotkey'])
-        self.keys_down = {name: False for name in self.hotkey_groups}
+        # Two independent chords: push-to-talk (hold) and continuous (tap to toggle)
+        self.ptt_groups = self._parse_hotkey(self.cfg['hotkey'])
+        self.ptt_down = {name: False for name in self.ptt_groups}
+        self._ptt_active = False
+        self.toggle_groups = self._parse_hotkey(self.cfg.get('toggle_hotkey', []), allow_empty=True)
+        self.toggle_down = {name: False for name in self.toggle_groups}
+        self._toggle_was_active = False
+        self.continuous = False
 
         self.icon = Icon(
             'murmur',
@@ -893,23 +923,21 @@ class MurmurApp:
         except Exception as e:
             log(f'ollama warmup failed: {e}')
 
-    def _parse_hotkey(self, spec):
+    def _parse_hotkey(self, spec, allow_empty=False):
         if isinstance(spec, str):
             spec = [spec]
         groups = {}
-        for name in spec:
+        for name in (spec or []):
             name = name.lower().strip()
             if name in KEY_GROUPS:
                 groups[name] = KEY_GROUPS[name]
-        if not groups:
+        if not groups and not allow_empty:
             groups = {'ctrl': CTRL_KEYS, 'cmd': WIN_KEYS}
         return groups
 
-    def _chord_active(self):
-        return all(self.keys_down.values())
-
-    def _which_group(self, key):
-        for name, group in self.hotkey_groups.items():
+    @staticmethod
+    def _key_group(groups, key):
+        for name, group in groups.items():
             if key in group:
                 return name
         return None
@@ -928,29 +956,147 @@ class MurmurApp:
         if self.floating_mic:
             self.tk_root.after(0, lambda c=color: self.floating_mic.set_state_color(c))
 
+    def _ptt_chord_active(self):
+        return bool(self.ptt_down) and all(self.ptt_down.values())
+
+    def _toggle_chord_active(self):
+        return bool(self.toggle_down) and all(self.toggle_down.values())
+
     def on_press(self, key):
-        group = self._which_group(key)
-        if group is None:
-            return
-        self.keys_down[group] = True
-        if self._chord_active() and self.state == 'idle':
+        pg = self._key_group(self.ptt_groups, key)
+        if pg:
+            self.ptt_down[pg] = True
+        tg = self._key_group(self.toggle_groups, key)
+        if tg:
+            self.toggle_down[tg] = True
+
+        # Continuous mode: fire once on the rising edge of the toggle chord
+        if self.toggle_groups:
+            if self._toggle_chord_active():
+                if not self._toggle_was_active:
+                    self._toggle_was_active = True
+                    self.toggle_continuous()
+            else:
+                self._toggle_was_active = False
+
+        # Push-to-talk: start on chord down (ignored while continuous mode owns the mic)
+        if pg and not self.continuous and not self._toggle_chord_active() \
+                and self._ptt_chord_active() and self.state == 'idle':
+            self._ptt_active = True
             self.set_state('listening')
             try:
                 self.recorder.start()
             except Exception as e:
                 print(f'[murmur] recorder start failed: {e}', file=sys.stderr)
+                self._ptt_active = False
                 self.set_state('idle')
 
     def on_release(self, key):
-        group = self._which_group(key)
-        if group is None:
-            return
-        was_active = self._chord_active()
-        self.keys_down[group] = False
-        if was_active and self.state == 'listening':
+        pg = self._key_group(self.ptt_groups, key)
+        tg = self._key_group(self.toggle_groups, key)
+        ptt_was_active = self._ptt_chord_active()
+        if pg:
+            self.ptt_down[pg] = False
+        if tg:
+            self.toggle_down[tg] = False
+        if not self._toggle_chord_active():
+            self._toggle_was_active = False
+
+        # Push-to-talk: stop + process when the chord is released
+        if pg and self._ptt_active and ptt_was_active and not self.continuous:
+            self._ptt_active = False
             audio = self.recorder.stop()
             self.set_state('processing')
             threading.Thread(target=self._process, args=(audio,), daemon=True).start()
+
+    def toggle_continuous(self):
+        """Tap the toggle hotkey to start/stop hands-free continuous dictation."""
+        if self.continuous:
+            log('continuous: stopping')
+            self.continuous = False  # worker flushes trailing audio, stops recorder, goes idle
+            return
+        if self.state != 'idle' or self._ptt_active:
+            return  # busy with push-to-talk
+        log('continuous: starting')
+        self.continuous = True
+        self.set_state('listening')
+        try:
+            self.recorder.start()
+        except Exception as e:
+            log(f'continuous recorder start failed: {e}')
+            self.continuous = False
+            self.set_state('idle')
+            return
+        threading.Thread(target=self._continuous_worker, daemon=True).start()
+
+    def _continuous_worker(self):
+        """Segment the live mic stream on silence; transcribe+clean+paste each
+        segment as it completes, so text flows while you keep talking."""
+        sr = int(self.cfg['sample_rate'])
+        SPEECH_RMS = 0.015     # above this = speech
+        SILENCE_HOLD = 0.6     # seconds of trailing silence that ends a segment
+        MIN_SEG = 0.4          # ignore blips shorter than this
+        MAX_SEG = 20.0         # force-flush a very long run
+        idx = 0
+        seg, seg_dur, sil_dur, speaking = [], 0.0, 0.0, False
+        try:
+            while self.continuous:
+                time.sleep(0.05)
+                frames = self.recorder.frames
+                n = len(frames)
+                while idx < n:
+                    chunk = frames[idx]
+                    idx += 1
+                    dur = len(chunk) / sr
+                    rms = float(np.sqrt(np.mean(chunk ** 2)))
+                    if rms >= SPEECH_RMS:
+                        speaking = True
+                        sil_dur = 0.0
+                        seg.append(chunk)
+                        seg_dur += dur
+                    elif speaking:
+                        seg.append(chunk)
+                        seg_dur += dur
+                        sil_dur += dur
+                    if speaking and seg_dur >= MIN_SEG and (sil_dur >= SILENCE_HOLD or seg_dur >= MAX_SEG):
+                        audio = np.concatenate(seg, axis=0).flatten()
+                        seg, seg_dur, sil_dur, speaking = [], 0.0, 0.0, False
+                        self._process_segment(audio)
+            # toggled off — flush whatever is buffered
+            if speaking and seg_dur >= MIN_SEG:
+                self._process_segment(np.concatenate(seg, axis=0).flatten())
+        except Exception as e:
+            import traceback
+            log(f'continuous worker error: {e}')
+            log(traceback.format_exc())
+        finally:
+            self.recorder.stop()
+            self.continuous = False
+            self.set_state('idle')
+
+    def _process_segment(self, audio):
+        """Transcribe/clean/paste one continuous-mode segment. Keeps the UI in
+        'listening' so the waveform stays live while the user keeps talking."""
+        try:
+            if audio is None or len(audio) < int(0.3 * self.cfg['sample_rate']):
+                return
+            dictionary = load_dictionary()
+            text, lang = self.transcriber.transcribe(audio, dictionary)
+            log(f'continuous segment [{lang}]: {text[:100]!r}')
+            if not text:
+                return
+            if self.cfg.get('cleanup_enabled', True):
+                backend = self.cfg.get('cleanup_backend', 'ollama')
+                model = self.cfg.get('cleanup_model', 'qwen2.5:7b')
+                if backend == 'claude':
+                    text = clean_with_claude(text, dictionary, model, lang)
+                else:
+                    text = clean_with_ollama(text, dictionary, model, self.cfg.get('ollama_url', 'http://localhost:11434'), lang)
+            if text:
+                paste_text(text, self.controller)
+                self._update_stats(text)
+        except Exception as e:
+            log(f'continuous segment error: {e}')
 
     def _process(self, audio):
         try:
@@ -1031,9 +1177,17 @@ class MurmurApp:
     def _on_settings_saved(self, new_cfg):
         self.cfg = new_cfg
         save_config(new_cfg)
-        self.hotkey_groups = self._parse_hotkey(new_cfg['hotkey'])
-        self.keys_down = {name: False for name in self.hotkey_groups}
-        self.recorder = Recorder(new_cfg['sample_rate'], new_cfg['max_record_sec'])
+        self.ptt_groups = self._parse_hotkey(new_cfg['hotkey'])
+        self.ptt_down = {name: False for name in self.ptt_groups}
+        self.toggle_groups = self._parse_hotkey(new_cfg.get('toggle_hotkey', []), allow_empty=True)
+        self.toggle_down = {name: False for name in self.toggle_groups}
+        self._toggle_was_active = False
+        if not self.continuous:  # don't yank the mic out from under a running session
+            self.recorder = Recorder(new_cfg['sample_rate'], new_cfg['max_record_sec'])
+        if new_cfg.get('bubble_visible', True):
+            self.tk_root.after(0, self.bubble.show_idle)  # (re)show + apply new position
+        else:
+            self.tk_root.after(0, self.bubble.hide_window)
         if new_cfg['model'] != self.transcriber.cfg.get('model'):
             self.transcriber = Transcriber(new_cfg)
             threading.Thread(target=self.transcriber.load, daemon=True).start()
@@ -1057,7 +1211,8 @@ class MurmurApp:
 
     def run(self):
         log(f'Murmur starting — claude_cli={CLAUDE_CLI}')
-        log(f'hotkey={list(self.hotkey_groups)}, model={self.cfg["model"]}, device={self.cfg["device"]}')
+        log(f'ptt={list(self.ptt_groups)}, toggle={list(self.toggle_groups)}, '
+            f'model={self.cfg["model"]}, device={self.cfg["device"]}')
         listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release)
         listener.start()
         threading.Thread(target=self.icon.run, daemon=True).start()
