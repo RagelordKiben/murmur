@@ -34,12 +34,47 @@ def _match_preset(spec):
     return list(HOTKEY_PRESETS.keys())[0]
 
 
-def open_settings_window(root, cfg, on_save):
+def _animate_expand(win, origin, final, steps=14, interval=12):
+    """Grow a window from the origin rect to the final rect (ease-out cubic)."""
+    ox, oy, ow, oh = origin
+    fx, fy, fw, fh = final
+
+    def step(i):
+        t = i / steps
+        e = 1 - (1 - t) ** 3
+        w = max(1, int(ow + (fw - ow) * e))
+        h = max(1, int(oh + (fh - oh) * e))
+        x = int(ox + (fx - ox) * e)
+        y = int(oy + (fy - oy) * e)
+        try:
+            win.geometry(f'{w}x{h}+{x}+{y}')
+        except tk.TclError:
+            return  # window was closed mid-animation
+        if i < steps:
+            win.after(interval, lambda: step(i + 1))
+
+    step(0)
+
+
+def open_settings_window(root, cfg, on_save, origin=None):
+    """origin: optional (x, y, w, h) rect to animate the window out of —
+    used when opened by double-clicking the status bubble."""
+    WIN_W, WIN_H = 500, 520
     win = tk.Toplevel(root)
     win.title('Murmur —Settings')
-    win.geometry('480x440')
     win.attributes('-topmost', True)
     win.configure(bg='#1e1e1e')
+    if origin:
+        ox, oy, ow, oh = origin
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        # Final rect: centered on the bubble, clamped onto the screen
+        fx = max(8, min(ox + ow // 2 - WIN_W // 2, sw - WIN_W - 8))
+        fy = max(8, min(oy + oh // 2 - WIN_H // 2, sh - WIN_H - 48))
+        win.geometry(f'{ow}x{oh}+{ox}+{oy}')
+        win.after(10, lambda: _animate_expand(win, (ox, oy, ow, oh), (fx, fy, WIN_W, WIN_H)))
+    else:
+        win.geometry(f'{WIN_W}x{WIN_H}')
 
     label_args = {'bg': '#1e1e1e', 'fg': '#ddd', 'font': ('Segoe UI', 10), 'anchor': 'w'}
     pad = {'padx': 14, 'pady': 5}

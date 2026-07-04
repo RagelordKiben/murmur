@@ -78,6 +78,9 @@ DEFAULTS = {
     'floating_button': True,
     'floating_x': None,   # remembered position (None = default bottom-right)
     'floating_y': None,
+    'bubble_visible': True,
+    'bubble_x': None,     # remembered position (None = default bottom-center)
+    'bubble_y': None,
 }
 
 CTRL_KEYS = {keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r}
@@ -448,6 +451,26 @@ def _safe_clip(value):
         pass
 
 
+def apply_no_activate(win):
+    """Keep a floating Tk window from stealing keyboard focus when clicked —
+    paste must go to the window the user was typing in, not the overlay."""
+    if sys.platform != 'win32':
+        return
+    try:
+        import ctypes
+        GWL_EXSTYLE = -20
+        WS_EX_NOACTIVATE = 0x08000000
+        WS_EX_TOOLWINDOW = 0x00000080
+        win.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id()) or win.winfo_id()
+        ex = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        ctypes.windll.user32.SetWindowLongW(
+            hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+        )
+    except Exception as e:
+        log(f'no-activate flag failed: {e}')
+
+
 class FloatingMic:
     """Always-on-top click-to-talk mic button. Press = start recording, release = stop.
     Mirrors the keyboard chord exactly so audio path is shared."""
@@ -500,21 +523,7 @@ class FloatingMic:
         self.win.geometry(f'{self.SIZE}x{self.SIZE}+{x}+{y}')
 
     def _apply_no_activate(self):
-        if sys.platform != 'win32':
-            return
-        try:
-            import ctypes
-            GWL_EXSTYLE = -20
-            WS_EX_NOACTIVATE = 0x08000000
-            WS_EX_TOOLWINDOW = 0x00000080
-            self.win.update_idletasks()
-            hwnd = ctypes.windll.user32.GetParent(self.win.winfo_id()) or self.win.winfo_id()
-            ex = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            ctypes.windll.user32.SetWindowLongW(
-                hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
-            )
-        except Exception as e:
-            log(f'no-activate flag failed: {e}')
+        apply_no_activate(self.win)
 
     def _draw(self, color):
         if not self.canvas:
@@ -593,14 +602,17 @@ class FloatingMic:
 
 
 class Bubble:
-    """Wispr-style floating status box, bottom-center of the screen.
-    Listening: a live waveform animated from the recorder's mic level.
-    Processing: static text. Idle: hidden."""
+    """Wispr-style persistent status pill, bottom-center by default.
+    Idle: dim flat strip. Listening: live waveform from the mic level.
+    Processing: text. Drag to move (position remembered). Double-click
+    expands into the settings window. Right-click hides it (re-enable
+    from the tray menu)."""
 
     BARS = 26
     W = 230
     H = 46
     TICK_MS = 50  # waveform refresh — one new bar every tick, scrolls right-to-left
+    DRAG_THRESHOLD = 6  # pixels — moves above this trigger drag instead of click
 
     def __init__(self, root, app=None):
         self.root = root
@@ -610,6 +622,13 @@ class Bubble:
         self._levels = None
         self._anim_job = None
         self._mode = None
+        self.dragging = False
+        self.press_root = (0, 0)
+        self.win_start = (0, 0)
+
+    @property
+    def enabled(self):
+        return bool(self.app is None or self.app.cfg.get('bubble_visible', True))
 
     def _ensure(self):
         if self.win is not None:
@@ -619,18 +638,30 @@ class Bubble:
         self.win.attributes('-topmost', True)
         self.win.attributes('-alpha', 0.92)
         self.win.configure(bg='#202020')
+        apply_no_activate(self.win)
         self.canvas = tk.Canvas(
             self.win, width=self.W, height=self.H,
-            bg='#202020', highlightthickness=0,
+            bg='#202020', highlightthickness=0, cursor='hand2',
         )
         self.canvas.pack()
+        # Drag to move, double-click for settings, right-click to hide
+        self.canvas.bind('<ButtonPress-1>', self._on_press)
+        self.canvas.bind('<B1-Motion>', self._on_move)
+        self.canvas.bind('<ButtonRelease-1>', self._on_release)
+        self.canvas.bind('<Double-Button-1>', self._on_double_click)
+        self.canvas.bind('<ButtonPress-3>', lambda _e: self._hide_forever())
         self.win.withdraw()
 
     def _place(self):
         self.win.update_idletasks()
-        sw = self.win.winfo_screenwidth()
-        sh = self.win.winfo_screenheight()
-        self.win.geometry(f'+{(sw - self.W) // 2}+{sh - 140}')
+        x = self.app.cfg.get('bubble_x') if self.app else None
+        y = self.app.cfg.get('bubble_y') if self.app else None
+        if x is None or y is None:
+            sw = self.win.winfo_screenwidth()
+            sh = self.win.winfo_screenheight()
+            x = (sw - self.W) // 2
+            y = sh - 140
+        self.win.geometry(f'{self.W}x{self.H}+{x}+{y}')
 
     def _stop_anim(self):
         if self._anim_job is not None:
@@ -640,12 +671,82 @@ class Bubble:
                 pass
             self._anim_job = None
 
+    # --- interaction -----------------------------------------------------
+
+    def _on_press(self, ev):
+        self.press_root = (ev.x_root, ev.y_root)
+        self.win_start = (self.win.winfo_x(), self.win.winfo_y())
+        self.dragging = False
+
+    def _on_move(self, ev):
+        dx = ev.x_root - self.press_root[0]
+        dy = ev.y_root - self.press_root[1]
+        if not self.dragging and (abs(dx) + abs(dy) > self.DRAG_THRESHOLD):
+            self.dragging = True
+        if self.dragging:
+            nx = self.win_start[0] + dx
+            ny = self.win_start[1] + dy
+            self.win.geometry(f'{self.W}x{self.H}+{nx}+{ny}')
+
+    def _on_release(self, _ev):
+        if not self.dragging:
+            return
+        self.dragging = False
+        if self.app:
+            try:
+                self.app.cfg['bubble_x'] = self.win.winfo_x()
+                self.app.cfg['bubble_y'] = self.win.winfo_y()
+                save_config(self.app.cfg)
+            except Exception as e:
+                log(f'failed saving bubble position: {e}')
+
+    def _on_double_click(self, _ev):
+        if self.dragging or not self.app:
+            return
+        rect = (self.win.winfo_x(), self.win.winfo_y(),
+                self.win.winfo_width(), self.win.winfo_height())
+        self.app.open_settings_from_bubble(rect)
+
+    def _hide_forever(self):
+        if self.app:
+            self.app.cfg['bubble_visible'] = False
+            save_config(self.app.cfg)
+        self.hide_window()
+
+    # --- states -----------------------------------------------------------
+
+    def show_idle(self):
+        """Dim flat strip — 'Murmur is running, mic off'."""
+        if not self.enabled:
+            self.hide_window()
+            return
+        self._ensure()
+        self._stop_anim()
+        self._mode = 'idle'
+        self.win.attributes('-alpha', 0.72)
+        self.win.configure(bg='#202020')
+        self.canvas.configure(bg='#202020')
+        c = self.canvas
+        c.delete('all')
+        bw = self.W / self.BARS
+        mid = self.H / 2
+        for i in range(self.BARS):
+            x = i * bw + bw * 0.25
+            c.create_rectangle(x, mid - 1.5, x + bw * 0.5, mid + 1.5,
+                               fill='#4a4a4a', outline='')
+        self._place()
+        self.win.deiconify()
+        self.win.lift()
+
     def show_wave(self):
         """Animated waveform while recording — the 'it hears you' signal."""
+        if not self.enabled:
+            return
         self._ensure()
         self._stop_anim()
         self._mode = 'wave'
         self._levels = deque([0.0] * self.BARS, maxlen=self.BARS)
+        self.win.attributes('-alpha', 0.92)
         self.win.configure(bg='#202020')
         self.canvas.configure(bg='#202020')
         self._place()
@@ -672,9 +773,12 @@ class Bubble:
         self._anim_job = self.win.after(self.TICK_MS, self._tick)
 
     def show(self, text, color='#202020'):
+        if not self.enabled:
+            return
         self._ensure()
         self._stop_anim()
         self._mode = 'text'
+        self.win.attributes('-alpha', 0.92)
         self.win.configure(bg=color)
         self.canvas.configure(bg=color)
         self.canvas.delete('all')
@@ -684,7 +788,7 @@ class Bubble:
         self.win.deiconify()
         self.win.lift()
 
-    def hide(self):
+    def hide_window(self):
         self._stop_anim()
         self._mode = None
         if self.win:
@@ -741,6 +845,7 @@ class MurmurApp:
         self.floating_mic = FloatingMic(self.tk_root, self) if self.cfg.get('floating_button', True) else None
         if self.floating_mic:
             self.tk_root.after(100, self.floating_mic.show)
+        self.tk_root.after(150, self.bubble.show_idle)  # persistent pill (no-op if hidden)
 
         self.hotkey_groups = self._parse_hotkey(self.cfg['hotkey'])
         self.keys_down = {name: False for name in self.hotkey_groups}
@@ -754,6 +859,11 @@ class MurmurApp:
                     'Show Floating Button',
                     self._menu_toggle_floating,
                     checked=lambda _i: self._floating_visible(),
+                ),
+                MenuItem(
+                    'Show Status Bubble',
+                    self._menu_toggle_bubble,
+                    checked=lambda _i: bool(self.cfg.get('bubble_visible', True)),
                 ),
                 MenuItem('Settings', self._menu_settings),
                 MenuItem('Edit Dictionary', self._menu_dictionary),
@@ -814,7 +924,7 @@ class MurmurApp:
         elif bubble_text:
             self.tk_root.after(0, lambda: self.bubble.show(bubble_text, bubble_bg))
         else:
-            self.tk_root.after(0, self.bubble.hide)
+            self.tk_root.after(0, self.bubble.show_idle)
         if self.floating_mic:
             self.tk_root.after(0, lambda c=color: self.floating_mic.set_state_color(c))
 
@@ -900,6 +1010,19 @@ class MurmurApp:
             self.tk_root.after(0, self.floating_mic.show)
             self.cfg['floating_button'] = True
         save_config(self.cfg)
+
+    def _menu_toggle_bubble(self, icon, item):
+        self.cfg['bubble_visible'] = not self.cfg.get('bubble_visible', True)
+        save_config(self.cfg)
+        if self.cfg['bubble_visible']:
+            self.tk_root.after(0, self.bubble.show_idle)
+        else:
+            self.tk_root.after(0, self.bubble.hide_window)
+
+    def open_settings_from_bubble(self, rect):
+        """Double-click on the bubble — settings window expands out of it."""
+        from settings_ui import open_settings_window
+        open_settings_window(self.tk_root, self.cfg, self._on_settings_saved, origin=rect)
 
     def _menu_settings(self, icon, item):
         from settings_ui import open_settings_window
