@@ -208,22 +208,27 @@ class Transcriber:
             log('whisper loaded on CPU')
 
     def transcribe(self, audio, dictionary):
+        """Returns (text, language) — language is the configured code, or the
+        Whisper-detected one when config is 'auto'. Used to pick the cleanup prompt."""
         self.load()  # no-op once loaded
         prompt = ', '.join(dictionary) if dictionary else None
         lang = self.cfg.get('language', 'en')
-        segments, _ = self.model.transcribe(
+        segments, info = self.model.transcribe(
             audio,
             language=None if lang == 'auto' else lang,
             initial_prompt=prompt,
             vad_filter=True,
         )
-        return ' '.join(s.text.strip() for s in segments).strip()
+        text = ' '.join(s.text.strip() for s in segments).strip()
+        used_lang = info.language if lang == 'auto' else lang
+        return text, (used_lang or 'en')
 
 
 CLEANUP_PROMPT = """You clean up dictated text. Follow the rules and study the examples.
 
 RULES:
 - Remove meaningless filler words (um, uh, like, you know) — keep them only when they carry meaning.
+- Keep hedges and opinion markers (I think, maybe, probably, kind of) — they carry meaning and are NOT fillers.
 - Add natural punctuation and capitalization.
 - Always end statements with a period, questions with a question mark.
 - Capitalize proper nouns, product names, and brand names (e.g., Whisper Flow, Claude, Bambu, DaVinci Resolve).
@@ -254,19 +259,69 @@ CLEANED: This is using it.
 INPUT: murmur
 CLEANED: Murmur.
 
+INPUT: so um the chorus needs like more energy i think
+CLEANED: So the chorus needs more energy, I think.
+
 NOW CLEAN THIS DICTATION:
 INPUT: {text}
 CLEANED:"""
 
 
-def clean_with_ollama(text, dictionary, model, url):
+CLEANUP_PROMPT_VI = """You clean up dictated Vietnamese text. Follow the rules and study the examples.
+
+RULES:
+- The dictation is in Vietnamese. The cleaned output MUST stay in Vietnamese — NEVER translate to English.
+- Preserve all Vietnamese diacritics exactly (ă â đ ê ô ơ ư and tone marks).
+- Remove meaningless filler words (ừm, ờ, à, kiểu như, đại loại là, nói chung là) — keep them only when they carry meaning.
+- Add natural punctuation and capitalization.
+- Always end statements with a period, questions with a question mark.
+- Capitalize proper nouns, product names, and brand names.
+- Apply spoken self-corrections ("à không", "nhầm", "ý là") — remove the struck-out portion, keep only the corrected version.
+- Keep English words spoken mid-sentence (code-switching) exactly as spoken — do not translate them to Vietnamese.
+- Copy every remaining word EXACTLY as spoken — never substitute a similar word. Never swap nha→nhé, đấy→đó, với lại→và, or any casual word for a formal one.
+- Preserve these terms EXACTLY as written: {dictionary}
+- Do NOT add words that weren't spoken. Do NOT change meaning. Do NOT formalize the tone. Do NOT wrap in quotes. Do NOT add preamble or explanation.
+
+EXAMPLES:
+
+INPUT: ừm cho mình xin cái file khi nào bạn rảnh nhé
+CLEANED: Cho mình xin cái file khi nào bạn rảnh nhé.
+
+INPUT: bài này cần thêm bass với lại trống nữa
+CLEANED: Bài này cần thêm bass với lại trống nữa.
+
+INPUT: hẹn gặp lúc 2 giờ à không 3 giờ chiều
+CLEANED: Hẹn gặp lúc 3 giờ chiều.
+
+INPUT: kiểu như là mình thấy bản mix này hơi đục ở phần trầm
+CLEANED: Mình thấy bản mix này hơi đục ở phần trầm.
+
+INPUT: anh gửi em cái project studio board qua email nhé
+CLEANED: Anh gửi em cái project Studio Board qua email nhé.
+
+INPUT: cái này dùng được không nhỉ
+CLEANED: Cái này dùng được không nhỉ?
+
+NOW CLEAN THIS DICTATION:
+INPUT: {text}
+CLEANED:"""
+
+
+# Prompt per transcription language; anything not listed falls back to English.
+CLEANUP_PROMPTS = {
+    'en': CLEANUP_PROMPT,
+    'vi': CLEANUP_PROMPT_VI,
+}
+
+
+def clean_with_ollama(text, dictionary, model, url, lang='en'):
     """Cleanup via local Ollama daemon — fast, free, offline, no quota impact."""
     if not text.strip():
         return text
     import urllib.request
     import urllib.error
     dict_str = ', '.join(dictionary) if dictionary else 'none'
-    prompt = CLEANUP_PROMPT.format(dictionary=dict_str, text=text)
+    prompt = CLEANUP_PROMPTS.get(lang, CLEANUP_PROMPT).format(dictionary=dict_str, text=text)
     payload = json.dumps({
         'model': model,
         'prompt': prompt,
@@ -318,7 +373,7 @@ def find_claude_cli():
 CLAUDE_CLI = find_claude_cli()
 
 
-def clean_with_claude(text, dictionary, model='haiku'):
+def clean_with_claude(text, dictionary, model='haiku', lang='en'):
     """Cleanup via the Claude Code CLI on the user's Max plan.
 
     Strips API-key env vars before invoking so a stale key cannot route
@@ -330,7 +385,7 @@ def clean_with_claude(text, dictionary, model='haiku'):
         print('[murmur] claude.exe not found on PATH or ~/.local/bin — skipping cleanup', file=sys.stderr)
         return text
     dict_str = ', '.join(dictionary) if dictionary else 'none'
-    prompt = CLEANUP_PROMPT.format(dictionary=dict_str, text=text)
+    prompt = CLEANUP_PROMPTS.get(lang, CLEANUP_PROMPT).format(dictionary=dict_str, text=text)
     env = os.environ.copy()
     for var in ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_API_KEY', 'CLAUDE_CODE_API_KEY'):
         env.pop(var, None)
@@ -735,8 +790,8 @@ class MurmurApp:
             dictionary = load_dictionary()
             log(f'transcribing with dict={len(dictionary)} terms')
             t0 = time.time()
-            text = self.transcriber.transcribe(audio, dictionary)
-            log(f'transcribed in {time.time()-t0:.1f}s: {text[:120]!r}')
+            text, lang = self.transcriber.transcribe(audio, dictionary)
+            log(f'transcribed in {time.time()-t0:.1f}s [{lang}]: {text[:120]!r}')
             if not text:
                 self.set_state('idle')
                 return
@@ -746,9 +801,9 @@ class MurmurApp:
                 model = self.cfg.get('cleanup_model', 'qwen2.5:7b')
                 log(f'cleanup via {backend}: {model}')
                 if backend == 'claude':
-                    text = clean_with_claude(text, dictionary, model)
+                    text = clean_with_claude(text, dictionary, model, lang)
                 else:
-                    text = clean_with_ollama(text, dictionary, model, self.cfg.get('ollama_url', 'http://localhost:11434'))
+                    text = clean_with_ollama(text, dictionary, model, self.cfg.get('ollama_url', 'http://localhost:11434'), lang)
                 log(f'cleaned in {time.time()-t0:.1f}s: {text[:120]!r}')
             log('pasting')
             paste_text(text, self.controller)
