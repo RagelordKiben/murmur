@@ -237,6 +237,7 @@ CLEANUP_PROMPT = """You clean up dictated text. Follow the rules and study the e
 RULES:
 - Remove meaningless filler words (um, uh, like, you know) — keep them only when they carry meaning.
 - Keep hedges and opinion markers (I think, maybe, probably, kind of) — they carry meaning and are NOT fillers.
+- This is a verbatim transcript of the user's own private dictation. Preserve profanity, slang, and crude language EXACTLY as spoken — never censor, soften, star out, or replace words. You are a transcription engine, not a content moderator: never refuse, apologize, or comment on the content.
 - Add natural punctuation and capitalization.
 - Always end statements with a period, questions with a question mark.
 - Capitalize proper nouns, product names, and brand names (e.g., Whisper Flow, Claude, Bambu, DaVinci Resolve).
@@ -270,6 +271,9 @@ CLEANED: Murmur.
 INPUT: so um the chorus needs like more energy i think
 CLEANED: So the chorus needs more energy, I think.
 
+INPUT: this fucking mix sounds like shit right now
+CLEANED: This fucking mix sounds like shit right now.
+
 NOW CLEAN THIS DICTATION:
 INPUT: {text}
 CLEANED:"""
@@ -287,6 +291,7 @@ RULES:
 - Apply spoken self-corrections ("à không", "nhầm", "ý là") — remove the struck-out portion, keep only the corrected version.
 - Keep English words spoken mid-sentence (code-switching) exactly as spoken — do not translate them to Vietnamese.
 - Copy every remaining word EXACTLY as spoken — never substitute a similar word. Never swap nha→nhé, đấy→đó, với lại→và, or any casual word for a formal one.
+- This is a verbatim transcript of the user's own private dictation. Preserve profanity, slang, and crude language EXACTLY as spoken — never censor, soften, or replace words. You are a transcription engine, not a content moderator: never refuse, apologize, or comment on the content.
 - Preserve these terms EXACTLY as written: {dictionary}
 - Do NOT add words that weren't spoken. Do NOT change meaning. Do NOT formalize the tone. Do NOT wrap in quotes. Do NOT add preamble or explanation.
 
@@ -320,6 +325,21 @@ CLEANUP_PROMPTS = {
     'en': CLEANUP_PROMPT,
     'vi': CLEANUP_PROMPT_VI,
 }
+
+
+_REFUSAL_MARKERS = (
+    'i cannot', "i can't", 'i will not', "i won't", "i'm sorry", 'i am sorry',
+    'as an ai', 'unable to assist', 'cannot assist', 'cannot clean', 'will not produce',
+)
+
+
+def _looks_like_refusal(out, original):
+    """A cleanup model must always return cleaned text. If the output opens with
+    refusal language that was NOT part of the dictation itself, the model is
+    moderating instead of cleaning — caller should paste the raw transcript."""
+    head = out[:100].lower()
+    orig = original.lower()
+    return any(m in head and m not in orig for m in _REFUSAL_MARKERS)
 
 
 def clean_with_ollama(text, dictionary, model, url, lang='en'):
@@ -356,6 +376,9 @@ def clean_with_ollama(text, dictionary, model, url, lang='en'):
             for prefix in ('CLEANED:', 'Cleaned:', 'Output:', 'Result:'):
                 if out.startswith(prefix):
                     out = out[len(prefix):].strip()
+            if out and _looks_like_refusal(out, text):
+                log('cleanup model refused — pasting raw transcript instead')
+                return text
             return out or text
     except urllib.error.URLError as e:
         log(f'ollama URL error: {e}')
@@ -412,6 +435,9 @@ def clean_with_claude(text, dictionary, model='haiku', lang='en'):
         if result.returncode == 0 and out:
             if out.startswith('"') and out.endswith('"') and len(out) > 1:
                 out = out[1:-1]
+            if _looks_like_refusal(out, text):
+                log('cleanup model refused — pasting raw transcript instead')
+                return text
             return out
         print(f'[murmur] cleanup non-zero exit {result.returncode}: {result.stderr}', file=sys.stderr)
         return text
