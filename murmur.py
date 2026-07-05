@@ -6,6 +6,7 @@ focused field. Custom dictionary biases recognition + protects
 proper nouns during cleanup.
 """
 import json
+import math
 import os
 import shutil
 import sys
@@ -76,9 +77,6 @@ DEFAULTS = {
     'ollama_url': 'http://localhost:11434',
     'sample_rate': 16000,
     'max_record_sec': 90,
-    'floating_button': True,
-    'floating_x': None,   # remembered position (None = default bottom-right)
-    'floating_y': None,
     'bubble_visible': True,
     'bubble_position': 'bottom-center',  # anchor, or 'custom' when dragged
     'bubble_x': None,     # remembered position when bubble_position == 'custom'
@@ -499,148 +497,21 @@ def apply_no_activate(win):
         log(f'no-activate flag failed: {e}')
 
 
-class FloatingMic:
-    """Always-on-top click-to-talk mic button. Press = start recording, release = stop.
-    Mirrors the keyboard chord exactly so audio path is shared."""
-
-    SIZE = 56  # pixels
-
-    DRAG_THRESHOLD = 6  # pixels — moves above this trigger drag instead of click
-
-    def __init__(self, root, app):
-        self.root = root
-        self.app = app
-        self.win = None
-        self.canvas = None
-        self.dragging = False
-        self.press_root = (0, 0)
-        self.win_start = (0, 0)
-        self.last_state_color = None
-
-    def _ensure(self):
-        if self.win is not None:
-            return
-        self.win = tk.Toplevel(self.root)
-        self.win.overrideredirect(True)
-        self.win.attributes('-topmost', True)
-        self.win.attributes('-alpha', 0.92)
-        self.win.configure(bg='#1a1a1a')
-        # Don't steal foreground focus when clicked — paste needs to go to the
-        # window the user was typing in, not to this mic button.
-        self._apply_no_activate()
-        self.canvas = tk.Canvas(
-            self.win, width=self.SIZE, height=self.SIZE,
-            bg='#1a1a1a', highlightthickness=0, cursor='hand2',
-        )
-        self.canvas.pack()
-        self._draw('#5a5a5a')
-        # Left-click: tap to toggle record/stop, hold-and-drag to move.
-        # Right-click: hide.
-        self.canvas.bind('<ButtonPress-1>', self._on_press)
-        self.canvas.bind('<B1-Motion>', self._on_move)
-        self.canvas.bind('<ButtonRelease-1>', self._on_release)
-        self.canvas.bind('<ButtonPress-3>', lambda _e: self.hide())
-        # Restore last position or default to bottom-right
-        x = self.app.cfg.get('floating_x')
-        y = self.app.cfg.get('floating_y')
-        if x is None or y is None:
-            sw = self.win.winfo_screenwidth()
-            sh = self.win.winfo_screenheight()
-            x = sw - self.SIZE - 28
-            y = sh - self.SIZE - 90
-        self.win.geometry(f'{self.SIZE}x{self.SIZE}+{x}+{y}')
-
-    def _apply_no_activate(self):
-        apply_no_activate(self.win)
-
-    def _draw(self, color):
-        if not self.canvas:
-            return
-        self.last_state_color = color
-        self.canvas.delete('all')
-        s = self.SIZE
-        # Outer circle
-        self.canvas.create_oval(2, 2, s - 2, s - 2, fill=color, outline='#ffd56b', width=2)
-        # Mic glyph (rounded body + stand)
-        cx = s // 2
-        body_top = int(s * 0.28)
-        body_bot = int(s * 0.62)
-        body_w = int(s * 0.18)
-        self.canvas.create_oval(cx - body_w, body_top, cx + body_w, body_bot, fill='white', outline='')
-        # Arc under mic
-        self.canvas.create_arc(
-            int(s * 0.26), int(s * 0.42), int(s * 0.74), int(s * 0.78),
-            start=200, extent=140, style='arc', outline='white', width=2,
-        )
-        # Stand
-        self.canvas.create_line(cx, int(s * 0.72), cx, int(s * 0.82), fill='white', width=2)
-        self.canvas.create_line(int(s * 0.42), int(s * 0.82), int(s * 0.58), int(s * 0.82), fill='white', width=2)
-
-    def show(self):
-        self._ensure()
-        self.win.deiconify()
-        self.win.lift()
-
-    def hide(self):
-        if self.win:
-            self.win.withdraw()
-
-    def set_state_color(self, color):
-        if self.win and self.canvas:
-            self._draw(color)
-
-    def _on_press(self, ev):
-        self.press_root = (ev.x_root, ev.y_root)
-        self.win_start = (self.win.winfo_x(), self.win.winfo_y())
-        self.dragging = False
-
-    def _on_move(self, ev):
-        dx = ev.x_root - self.press_root[0]
-        dy = ev.y_root - self.press_root[1]
-        if not self.dragging and (abs(dx) + abs(dy) > self.DRAG_THRESHOLD):
-            self.dragging = True
-        if self.dragging:
-            nx = self.win_start[0] + dx
-            ny = self.win_start[1] + dy
-            self.win.geometry(f'{self.SIZE}x{self.SIZE}+{nx}+{ny}')
-
-    def _on_release(self, _ev):
-        if self.dragging:
-            # Was a drag — persist new position, no recording
-            try:
-                self.app.cfg['floating_x'] = self.win.winfo_x()
-                self.app.cfg['floating_y'] = self.win.winfo_y()
-                save_config(self.app.cfg)
-            except Exception as e:
-                log(f'failed saving floating position: {e}')
-            self.dragging = False
-            return
-        # Was a click — toggle record/stop
-        if self.app.state == 'idle':
-            self.app.set_state('listening')
-            try:
-                self.app.recorder.start()
-            except Exception as e:
-                print(f'[murmur] recorder start failed: {e}', file=sys.stderr)
-                self.app.set_state('idle')
-        elif self.app.state == 'listening':
-            audio = self.app.recorder.stop()
-            self.app.set_state('processing')
-            threading.Thread(target=self.app._process, args=(audio,), daemon=True).start()
-
-
 class Bubble:
-    """Wispr-style persistent status pill, bottom-center by default.
-    Idle: dim flat strip. Listening: live waveform from the mic level.
-    Processing: text. Drag to move (position remembered). Double-click
-    expands into the settings window. Right-click hides it (re-enable
-    from the tray menu)."""
+    """Wispr-Flow-style compact pill, bottom-center by default. A true rounded
+    capsule (color-key transparency outside the shape). Idle: dim dots.
+    Listening: live waveform bars from the mic level. Processing: pulsing dots.
+    Drag to move (position remembered). Double-click expands into the settings
+    window. Right-click hides it (re-enable from the tray menu)."""
 
-    BARS = 26
-    W = 230
-    H = 46
+    W = 124
+    H = 34
+    BARS = 13
     TICK_MS = 50  # waveform refresh — one new bar every tick, scrolls right-to-left
     DRAG_THRESHOLD = 6  # pixels — moves above this trigger drag instead of click
+    KEY = '#010203'  # transparency color key — anything this color is see-through
+    PILL_BG = '#1c1c1c'
+    PILL_EDGE = '#3a3a3a'
 
     def __init__(self, root, app=None):
         self.root = root
@@ -650,6 +521,7 @@ class Bubble:
         self._levels = None
         self._anim_job = None
         self._mode = None
+        self._phase = 0
         self.dragging = False
         self.press_root = (0, 0)
         self.win_start = (0, 0)
@@ -664,12 +536,18 @@ class Bubble:
         self.win = tk.Toplevel(self.root)
         self.win.overrideredirect(True)
         self.win.attributes('-topmost', True)
-        self.win.attributes('-alpha', 0.92)
-        self.win.configure(bg='#202020')
+        self.win.attributes('-alpha', 0.95)
+        self.win.configure(bg=self.KEY)
+        try:
+            # Everything painted in the key color becomes transparent — this is
+            # what turns the rectangular Tk window into an actual capsule.
+            self.win.attributes('-transparentcolor', self.KEY)
+        except Exception as e:
+            log(f'transparentcolor unsupported, pill will be rectangular: {e}')
         apply_no_activate(self.win)
         self.canvas = tk.Canvas(
             self.win, width=self.W, height=self.H,
-            bg='#202020', highlightthickness=0, cursor='hand2',
+            bg=self.KEY, highlightthickness=0, cursor='hand2',
         )
         self.canvas.pack()
         # Drag to move, double-click for settings, right-click to hide
@@ -679,6 +557,21 @@ class Bubble:
         self.canvas.bind('<Double-Button-1>', self._on_double_click)
         self.canvas.bind('<ButtonPress-3>', lambda _e: self._hide_forever())
         self.win.withdraw()
+
+    def _draw_pill(self):
+        """Capsule base: smooth rounded polygon on the transparent key color."""
+        c = self.canvas
+        c.delete('all')
+        x0, y0, x1, y1 = 1, 1, self.W - 2, self.H - 2
+        r = (y1 - y0) / 2
+        pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1,
+               x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+        c.create_polygon(pts, smooth=True, fill=self.PILL_BG, outline=self.PILL_EDGE)
+
+    def _bar_xs(self):
+        span = self.W - 48  # bar strip, centered inside the capsule
+        step = span / (self.BARS - 1)
+        return [24 + i * step for i in range(self.BARS)]
 
     def _anchor_xy(self, pos):
         self.win.update_idletasks()
@@ -766,24 +659,19 @@ class Bubble:
     # --- states -----------------------------------------------------------
 
     def show_idle(self):
-        """Dim flat strip — 'Murmur is running, mic off'."""
+        """Dim row of dots — 'Murmur is running, mic off'."""
         if not self.enabled:
             self.hide_window()
             return
         self._ensure()
         self._stop_anim()
         self._mode = 'idle'
-        self.win.attributes('-alpha', 0.72)
-        self.win.configure(bg='#202020')
-        self.canvas.configure(bg='#202020')
-        c = self.canvas
-        c.delete('all')
-        bw = self.W / self.BARS
+        self.win.attributes('-alpha', 0.65)
+        self._draw_pill()
         mid = self.H / 2
-        for i in range(self.BARS):
-            x = i * bw + bw * 0.25
-            c.create_rectangle(x, mid - 1.5, x + bw * 0.5, mid + 1.5,
-                               fill='#4a4a4a', outline='')
+        for x in self._bar_xs():
+            self.canvas.create_oval(x - 1.4, mid - 1.4, x + 1.4, mid + 1.4,
+                                    fill='#5a5a5a', outline='')
         self._place()
         self.win.deiconify()
         self.win.lift()
@@ -796,9 +684,7 @@ class Bubble:
         self._stop_anim()
         self._mode = 'wave'
         self._levels = deque([0.0] * self.BARS, maxlen=self.BARS)
-        self.win.attributes('-alpha', 0.92)
-        self.win.configure(bg='#202020')
-        self.canvas.configure(bg='#202020')
+        self.win.attributes('-alpha', 0.95)
         self._place()
         self.win.deiconify()
         self.win.lift()
@@ -811,32 +697,42 @@ class Bubble:
         # Speech RMS is roughly 0.02–0.3; scale into 0..1 with a floor so the
         # bar strip stays visible (and clearly "waiting") during silence.
         self._levels.append(min(1.0, raw * 8.0))
+        self._draw_pill()
         c = self.canvas
-        c.delete('all')
-        bw = self.W / self.BARS
         mid = self.H / 2
-        for i, lv in enumerate(self._levels):
-            h = max(3.0, lv * (self.H - 10))
-            x = i * bw + bw * 0.25
-            c.create_rectangle(x, mid - h / 2, x + bw * 0.5, mid + h / 2,
-                               fill='#e64545', outline='')
+        max_h = self.H - 12
+        for x, lv in zip(self._bar_xs(), self._levels):
+            h = max(2.8, lv * max_h)
+            c.create_rectangle(x - 1.6, mid - h / 2, x + 1.6, mid + h / 2,
+                               fill='#f2f2f2', outline='')
         self._anim_job = self.win.after(self.TICK_MS, self._tick)
 
-    def show(self, text, color='#202020'):
+    def show_processing(self):
+        """Three gold dots doing a gentle wave while Whisper + the LLM work."""
         if not self.enabled:
             return
         self._ensure()
         self._stop_anim()
-        self._mode = 'text'
-        self.win.attributes('-alpha', 0.92)
-        self.win.configure(bg=color)
-        self.canvas.configure(bg=color)
-        self.canvas.delete('all')
-        self.canvas.create_text(self.W / 2, self.H / 2, text=text, fill='white',
-                                font=('Segoe UI', 11, 'bold'))
+        self._mode = 'proc'
+        self._phase = 0
+        self.win.attributes('-alpha', 0.95)
         self._place()
         self.win.deiconify()
         self.win.lift()
+        self._tick_processing()
+
+    def _tick_processing(self):
+        if self._mode != 'proc':
+            return
+        self._draw_pill()
+        c = self.canvas
+        cx, mid = self.W / 2, self.H / 2
+        for i in range(3):
+            s = 2.4 + 1.6 * max(0.0, math.sin((self._phase - i * 2) * 0.55))
+            x = cx + (i - 1) * 13
+            c.create_oval(x - s, mid - s, x + s, mid + s, fill='#ffd56b', outline='')
+        self._phase += 1
+        self._anim_job = self.win.after(80, self._tick_processing)
 
     def hide_window(self):
         self._stop_anim()
@@ -892,9 +788,6 @@ class MurmurApp:
         self.tk_root = tk.Tk()
         self.tk_root.withdraw()
         self.bubble = Bubble(self.tk_root, self)
-        self.floating_mic = FloatingMic(self.tk_root, self) if self.cfg.get('floating_button', True) else None
-        if self.floating_mic:
-            self.tk_root.after(100, self.floating_mic.show)
         self.tk_root.after(150, self.bubble.show_idle)  # persistent pill (no-op if hidden)
 
         # Two independent chords: push-to-talk (hold) and continuous (tap to toggle)
@@ -911,11 +804,6 @@ class MurmurApp:
             make_icon_image(STATE_VISUAL['idle'][0]),
             title='Murmur — Idle',
             menu=Menu(
-                MenuItem(
-                    'Show Floating Button',
-                    self._menu_toggle_floating,
-                    checked=lambda _i: self._floating_visible(),
-                ),
                 MenuItem(
                     'Show Status Bubble',
                     self._menu_toggle_bubble,
@@ -975,12 +863,10 @@ class MurmurApp:
         self.icon.title = f'Murmur — {state.capitalize()}'
         if state == 'listening':
             self.tk_root.after(0, self.bubble.show_wave)
-        elif bubble_text:
-            self.tk_root.after(0, lambda: self.bubble.show(bubble_text, bubble_bg))
+        elif state == 'processing':
+            self.tk_root.after(0, self.bubble.show_processing)
         else:
             self.tk_root.after(0, self.bubble.show_idle)
-        if self.floating_mic:
-            self.tk_root.after(0, lambda c=color: self.floating_mic.set_state_color(c))
 
     def _ptt_chord_active(self):
         return bool(self.ptt_down) and all(self.ptt_down.values())
@@ -1167,21 +1053,6 @@ class MurmurApp:
         self.stats['sessions'] = self.stats.get('sessions', 0) + 1
         self.stats['last_session'] = time.strftime('%Y-%m-%d %H:%M:%S')
         save_stats(self.stats)
-
-    def _floating_visible(self):
-        return bool(self.floating_mic and self.floating_mic.win and self.floating_mic.win.winfo_viewable())
-
-    def _menu_toggle_floating(self, icon, item):
-        # Lazily create the floating mic if it was disabled at startup
-        if self.floating_mic is None:
-            self.floating_mic = FloatingMic(self.tk_root, self)
-        if self._floating_visible():
-            self.tk_root.after(0, self.floating_mic.hide)
-            self.cfg['floating_button'] = False
-        else:
-            self.tk_root.after(0, self.floating_mic.show)
-            self.cfg['floating_button'] = True
-        save_config(self.cfg)
 
     def _menu_toggle_bubble(self, icon, item):
         self.cfg['bubble_visible'] = not self.cfg.get('bubble_visible', True)
