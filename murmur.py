@@ -478,9 +478,10 @@ CLAUDE_CLI = find_claude_cli()
 # --- Reliability: Ollama autostart + run-on-login ---------------------------
 
 OLLAMA_APP = Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'Ollama' / 'ollama app.exe'
-STARTUP_DIR = (Path(os.environ.get('APPDATA', '')) / 'Microsoft' / 'Windows'
-               / 'Start Menu' / 'Programs' / 'Startup')
-STARTUP_LNK = STARTUP_DIR / 'Murmur.lnk'
+_PROGRAMS = Path(os.environ.get('APPDATA', '')) / 'Microsoft' / 'Windows' / 'Start Menu' / 'Programs'
+STARTUP_LNK = _PROGRAMS / 'Startup' / 'Murmur.lnk'   # launches at login
+START_MENU_LNK = _PROGRAMS / 'Murmur.lnk'            # searchable in the Start menu
+ICON_ICO = Path(__file__).parent / 'assets' / 'icon.ico'
 
 
 def ollama_reachable(url, timeout=1.5):
@@ -513,33 +514,61 @@ def ensure_ollama_running(url, wait=12.0):
     return ollama_reachable(url)
 
 
+def _make_shortcut(lnk):
+    """Create a .lnk that launches Murmur windowless, with the app icon."""
+    lnk.parent.mkdir(parents=True, exist_ok=True)
+    pyw = str(Path(sys.executable).with_name('pythonw.exe'))
+    script = str(Path(__file__).resolve())
+    workdir = str(Path(__file__).resolve().parent)
+    icon = f"$s.IconLocation='{ICON_ICO}';" if ICON_ICO.exists() else ''
+    ps = (
+        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%s');"
+        "$s.TargetPath='%s';$s.Arguments='\"%s\"';"
+        "$s.WorkingDirectory='%s';%s"
+        "$s.Description='Murmur - local voice dictation';$s.WindowStyle=7;$s.Save()"
+    ) % (lnk, pyw, script, workdir, icon)
+    subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps],
+                   creationflags=CREATE_NO_WINDOW, timeout=15)
+
+
+def _remove_shortcut(lnk):
+    try:
+        lnk.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log(f'failed to remove shortcut {lnk.name}: {e}')
+
+
 def startup_enabled():
     return STARTUP_LNK.exists()
 
 
 def set_startup(enable):
     """Create/remove a Startup-folder shortcut so Murmur launches at login."""
-    if not enable:
+    if enable:
         try:
-            STARTUP_LNK.unlink()
-        except FileNotFoundError:
-            pass
+            _make_shortcut(STARTUP_LNK)
         except Exception as e:
-            log(f'failed to remove startup shortcut: {e}')
-        return
-    try:
-        pyw = str(Path(sys.executable).with_name('pythonw.exe'))
-        script = str(Path(__file__).resolve())
-        workdir = str(Path(__file__).resolve().parent)
-        ps = (
-            "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%s');"
-            "$s.TargetPath='%s';$s.Arguments='\"%s\"';"
-            "$s.WorkingDirectory='%s';$s.WindowStyle=7;$s.Save()"
-        ) % (STARTUP_LNK, pyw, script, workdir)
-        subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps],
-                       creationflags=CREATE_NO_WINDOW, timeout=15)
-    except Exception as e:
-        log(f'failed to create startup shortcut: {e}')
+            log(f'failed to create startup shortcut: {e}')
+    else:
+        _remove_shortcut(STARTUP_LNK)
+
+
+def start_menu_enabled():
+    return START_MENU_LNK.exists()
+
+
+def set_start_menu(enable):
+    """Create/remove a Start-menu shortcut (searchable as 'Murmur')."""
+    if enable:
+        try:
+            _make_shortcut(START_MENU_LNK)
+            log('Start Menu shortcut created')
+        except Exception as e:
+            log(f'failed to create Start Menu shortcut: {e}')
+    else:
+        _remove_shortcut(START_MENU_LNK)
 
 
 def clean_with_claude(text, dictionary, model='haiku', lang='en', tone=None):
@@ -1439,6 +1468,11 @@ class MurmurApp:
                     self._menu_toggle_startup,
                     checked=lambda _i: startup_enabled(),
                 ),
+                MenuItem(
+                    'Add to Start Menu',
+                    self._menu_toggle_start_menu,
+                    checked=lambda _i: start_menu_enabled(),
+                ),
                 MenuItem('Settings', self._menu_settings),
                 MenuItem('Edit Dictionary', self._menu_dictionary),
                 MenuItem('Edit Commands', self._menu_commands),
@@ -1756,6 +1790,9 @@ class MurmurApp:
 
     def _menu_toggle_startup(self, icon, item):
         set_startup(not startup_enabled())
+
+    def _menu_toggle_start_menu(self, icon, item):
+        set_start_menu(not start_menu_enabled())
 
     def open_settings_from_bubble(self):
         """Double-click on the bubble toggles Settings open/closed."""
