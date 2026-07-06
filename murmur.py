@@ -555,6 +555,32 @@ def set_startup(enable):
         _remove_shortcut(STARTUP_LNK)
 
 
+_SINGLE_INSTANCE_HANDLE = None
+
+
+def acquire_single_instance(name='Murmur-SingleInstance'):
+    """Hold a named mutex so only one Murmur runs. Returns False if another
+    instance already owns it (the caller should then exit)."""
+    global _SINGLE_INSTANCE_HANDLE
+    if sys.platform != 'win32':
+        return True
+    try:
+        import ctypes
+        k = ctypes.WinDLL('kernel32', use_last_error=True)
+        k.CreateMutexW.restype = ctypes.c_void_p
+        k.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        h = k.CreateMutexW(None, False, name)
+        err = ctypes.get_last_error()
+        ERROR_ALREADY_EXISTS = 183
+        if not h or err == ERROR_ALREADY_EXISTS:
+            return False
+        _SINGLE_INSTANCE_HANDLE = h  # keep alive for the process lifetime
+        return True
+    except Exception as e:
+        log(f'single-instance check failed ({e}); continuing')
+        return True
+
+
 def start_menu_enabled():
     return START_MENU_LNK.exists()
 
@@ -1869,4 +1895,7 @@ class MurmurApp:
 
 
 if __name__ == '__main__':
+    if not acquire_single_instance():
+        log('another instance is already running — exiting')
+        sys.exit(0)
     MurmurApp().run()
