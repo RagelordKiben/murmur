@@ -540,6 +540,8 @@ class Bubble:
         self._anim_job = None
         self._mode = None
         self._phase = 0
+        self._layered = False
+        self._photo = None
         self.dragging = False
         self.press_root = (0, 0)
         self.win_start = (0, 0)
@@ -554,15 +556,23 @@ class Bubble:
         self.win = tk.Toplevel(self.root)
         self.win.overrideredirect(True)
         self.win.attributes('-topmost', True)
-        self.win.attributes('-alpha', 0.95)
         self.win.configure(bg=self.KEY)
-        try:
-            # Everything painted in the key color becomes transparent — this is
-            # what turns the rectangular Tk window into an actual capsule.
-            self.win.attributes('-transparentcolor', self.KEY)
-        except Exception as e:
-            log(f'transparentcolor unsupported, pill will be rectangular: {e}')
         apply_no_activate(self.win)
+        # Per-pixel alpha via UpdateLayeredWindow — how Electron/Qt apps get
+        # smooth window edges. Requires WS_EX_LAYERED and NO Tk -alpha /
+        # -transparentcolor on this window (those use the older color-key API).
+        if sys.platform == 'win32':
+            try:
+                import ctypes
+                GWL_EXSTYLE = -20
+                WS_EX_LAYERED = 0x00080000
+                self.win.update_idletasks()
+                hwnd = ctypes.windll.user32.GetParent(self.win.winfo_id()) or self.win.winfo_id()
+                ex = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED)
+                self._layered = True
+            except Exception as e:
+                log(f'layered window setup failed, using color-key fallback: {e}')
         self.canvas = tk.Canvas(
             self.win, width=self.W, height=self.H,
             bg=self.KEY, highlightthickness=0, cursor='hand2',
@@ -577,14 +587,14 @@ class Bubble:
         self.win.withdraw()
         self._assert_topmost()  # starts the keep-on-top watchdog loop
 
-    SS = 4  # supersample factor — render 4x with PIL, downscale for smooth edges
+    SS = 4  # supersample factor — render 4x with PIL, downscale for smooth curves
 
-    def _render(self, draw_content):
-        """Draw the capsule + content with PIL at 4x resolution and downsample.
-        Color-key transparency can't antialias, but supersampling blends the
-        edge pixels into a soft fringe so the pill no longer looks jagged."""
+    def _render(self, draw_content, opacity=0.95):
+        """Draw the capsule + content into an RGBA frame (4x supersampled) and
+        composite it with true per-pixel alpha. Edges blend against whatever is
+        behind the window — actually smooth, unlike color-key transparency."""
         S = self.SS
-        img = Image.new('RGB', (self.W * S, self.H * S), self.KEY)
+        img = Image.new('RGBA', (self.W * S, self.H * S), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         m = S  # 1 logical px margin
         d.rounded_rectangle(
@@ -594,9 +604,89 @@ class Bubble:
         )
         draw_content(d, S)
         img = img.resize((self.W, self.H), Image.LANCZOS)
-        self._photo = ImageTk.PhotoImage(img)  # keep the ref or Tk drops the image
+        if self._layered:
+            try:
+                self._push_frame(img, opacity)
+                return
+            except Exception as e:
+                log(f'layered paint failed, using color-key fallback: {e}')
+                self._layered = False
+        # Fallback (non-Windows or layered failure): color-key transparency
+        try:
+            self.win.attributes('-transparentcolor', self.KEY)
+            self.win.attributes('-alpha', opacity)
+        except Exception:
+            pass
+        flat = Image.new('RGB', img.size, self.KEY)
+        flat.paste(img, (0, 0), img)
+        self._photo = ImageTk.PhotoImage(flat)  # keep the ref or Tk drops the image
         self.canvas.delete('all')
         self.canvas.create_image(0, 0, anchor='nw', image=self._photo)
+
+    def _push_frame(self, img, opacity):
+        """Blit an RGBA PIL frame onto this window via UpdateLayeredWindow —
+        the compositor blends our alpha channel per pixel (DWM does the rest)."""
+        import ctypes
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [('biSize', ctypes.c_uint32), ('biWidth', ctypes.c_int32),
+                        ('biHeight', ctypes.c_int32), ('biPlanes', ctypes.c_uint16),
+                        ('biBitCount', ctypes.c_uint16), ('biCompression', ctypes.c_uint32),
+                        ('biSizeImage', ctypes.c_uint32), ('biXPelsPerMeter', ctypes.c_int32),
+                        ('biYPelsPerMeter', ctypes.c_int32), ('biClrUsed', ctypes.c_uint32),
+                        ('biClrImportant', ctypes.c_uint32)]
+
+        class BLENDFUNCTION(ctypes.Structure):
+            _fields_ = [('BlendOp', ctypes.c_ubyte), ('BlendFlags', ctypes.c_ubyte),
+                        ('SourceConstantAlpha', ctypes.c_ubyte), ('AlphaFormat', ctypes.c_ubyte)]
+
+        class POINT(ctypes.Structure):
+            _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+
+        class SIZE(ctypes.Structure):
+            _fields_ = [('cx', ctypes.c_long), ('cy', ctypes.c_long)]
+
+        user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+        for fn in (user32.GetDC, gdi32.CreateCompatibleDC, gdi32.CreateDIBSection,
+                   gdi32.SelectObject):
+            fn.restype = ctypes.c_void_p  # handles are 64-bit; default c_int truncates
+
+        w, h = img.size
+        arr = np.asarray(img, dtype=np.uint8)
+        a = arr[..., 3].astype(np.uint16)
+        bgra = np.empty((h, w, 4), dtype=np.uint8)
+        bgra[..., 0] = (arr[..., 2].astype(np.uint16) * a // 255).astype(np.uint8)
+        bgra[..., 1] = (arr[..., 1].astype(np.uint16) * a // 255).astype(np.uint8)
+        bgra[..., 2] = (arr[..., 0].astype(np.uint16) * a // 255).astype(np.uint8)
+        bgra[..., 3] = arr[..., 3]  # UpdateLayeredWindow wants premultiplied BGRA
+        data = bgra.tobytes()
+
+        hwnd = user32.GetParent(ctypes.c_void_p(self.win.winfo_id())) or self.win.winfo_id()
+        bmi = BITMAPINFOHEADER()
+        bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.biWidth, bmi.biHeight = w, -h  # negative = top-down rows
+        bmi.biPlanes, bmi.biBitCount, bmi.biCompression = 1, 32, 0
+
+        screen_dc = user32.GetDC(None)
+        mem_dc = gdi32.CreateCompatibleDC(ctypes.c_void_p(screen_dc))
+        bits = ctypes.c_void_p()
+        hbmp = gdi32.CreateDIBSection(ctypes.c_void_p(screen_dc), ctypes.byref(bmi),
+                                      0, ctypes.byref(bits), None, 0)
+        try:
+            ctypes.memmove(bits, data, len(data))
+            old = gdi32.SelectObject(ctypes.c_void_p(mem_dc), ctypes.c_void_p(hbmp))
+            blend = BLENDFUNCTION(0, 0, int(opacity * 255), 1)  # AC_SRC_OVER / AC_SRC_ALPHA
+            size, src = SIZE(w, h), POINT(0, 0)
+            ULW_ALPHA = 2
+            user32.UpdateLayeredWindow(ctypes.c_void_p(hwnd), ctypes.c_void_p(screen_dc),
+                                       None, ctypes.byref(size),
+                                       ctypes.c_void_p(mem_dc), ctypes.byref(src),
+                                       0, ctypes.byref(blend), ULW_ALPHA)
+            gdi32.SelectObject(ctypes.c_void_p(mem_dc), ctypes.c_void_p(old))
+        finally:
+            gdi32.DeleteObject(ctypes.c_void_p(hbmp))
+            gdi32.DeleteDC(ctypes.c_void_p(mem_dc))
+            user32.ReleaseDC(None, ctypes.c_void_p(screen_dc))
 
     def _bar_xs(self):
         pad = self.H / 2 + 6  # keep the bar strip clear of the round end caps
@@ -714,7 +804,6 @@ class Bubble:
         self._ensure()
         self._stop_anim()
         self._mode = 'idle'
-        self.win.attributes('-alpha', 0.65)
 
         def content(d, S):
             mid = self.H * S / 2
@@ -722,7 +811,7 @@ class Bubble:
             for x in self._bar_xs():
                 cx = x * S
                 d.ellipse([cx - r, mid - r, cx + r, mid + r], fill='#5a5a5a')
-        self._render(content)
+        self._render(content, opacity=0.65)
         self._place()
         self.win.deiconify()
         self.win.lift()
@@ -735,7 +824,6 @@ class Bubble:
         self._stop_anim()
         self._mode = 'wave'
         self._levels = deque([0.0] * self.BARS, maxlen=self.BARS)
-        self.win.attributes('-alpha', 0.95)
         self._place()
         self.win.deiconify()
         self.win.lift()
@@ -769,7 +857,6 @@ class Bubble:
         self._stop_anim()
         self._mode = 'proc'
         self._phase = 0
-        self.win.attributes('-alpha', 0.95)
         self._place()
         self.win.deiconify()
         self.win.lift()
