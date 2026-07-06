@@ -54,6 +54,7 @@ MURMUR_DIR = Path.home() / '.murmur'
 MURMUR_DIR.mkdir(exist_ok=True)
 CONFIG_PATH = MURMUR_DIR / 'config.json'
 DICT_PATH = MURMUR_DIR / 'dictionary.txt'
+COMMANDS_PATH = MURMUR_DIR / 'commands.txt'
 STATS_PATH = MURMUR_DIR / 'stats.json'
 LOG_PATH = MURMUR_DIR / 'murmur.log'
 
@@ -80,7 +81,10 @@ DEFAULTS = {
     'max_record_sec': 90,
     'voice_commands': True,   # spoken "new line", "scratch that", "send it", etc.
     'tone_matching': True,    # nudge cleanup tone to match the foreground app
-    'sounds': True,           # start/stop beeps
+    'sounds': True,           # start/stop blips
+    'cue_volume': 35,         # blip volume, 0-100
+    'cue_sound': 'Soft sine', # built-in preset name, or 'Custom file…'
+    'cue_file': '',           # WAV path when cue_sound == 'Custom file…'
     'bubble_visible': True,
     'bubble_position': 'bottom-center',  # anchor, or 'custom' when dragged
     'bubble_x': None,     # remembered position when bubble_position == 'custom'
@@ -525,44 +529,84 @@ def clean_with_claude(text, dictionary, model='haiku', lang='en', tone=None):
 
 # --- Voice commands, tone matching, sound cues ------------------------------
 
-VOICE_COMMANDS = {
-    'new line': 'newline', 'newline': 'newline', 'line break': 'newline',
-    'new paragraph': 'paragraph', 'paragraph break': 'paragraph',
-    'scratch that': 'undo', 'delete that': 'undo', 'undo that': 'undo', 'undo': 'undo',
-    'send it': 'send', 'send message': 'send', 'send that': 'send', 'press enter': 'send',
+# Action name -> keystroke recipe. 'taps' = keys pressed one at a time;
+# 'chord' = modifiers held while the last key is pressed.
+COMMAND_ACTIONS = {
+    'newline':   {'taps': [keyboard.Key.enter]},
+    'paragraph': {'taps': [keyboard.Key.enter, keyboard.Key.enter]},
+    'send':      {'taps': [keyboard.Key.enter]},
+    'enter':     {'taps': [keyboard.Key.enter]},
+    'tab':       {'taps': [keyboard.Key.tab]},
+    'escape':    {'taps': [keyboard.Key.esc]},
+    'space':     {'taps': [keyboard.Key.space]},
+    'backspace': {'taps': [keyboard.Key.backspace]},
+    'undo':      {'chord': [keyboard.Key.ctrl, 'z']},
+    'redo':      {'chord': [keyboard.Key.ctrl, keyboard.Key.shift, 'z']},
+    'selectall': {'chord': [keyboard.Key.ctrl, 'a']},
+    'copy':      {'chord': [keyboard.Key.ctrl, 'c']},
+    'cut':       {'chord': [keyboard.Key.ctrl, 'x']},
+    'paste':     {'chord': [keyboard.Key.ctrl, 'v']},
+    'save':      {'chord': [keyboard.Key.ctrl, 's']},
 }
 
-# Shown in Settings so the commands are easy to find. (label, spoken phrases, effect)
-VOICE_COMMAND_HELP = [
-    ('New line', '"new line", "line break"', 'inserts a line break'),
-    ('New paragraph', '"new paragraph"', 'inserts a blank line'),
-    ('Undo last', '"scratch that", "delete that"', 'presses Ctrl+Z'),
-    ('Send', '"send it", "press enter"', 'presses Enter'),
-]
+DEFAULT_COMMANDS_TEXT = """# Voice commands — say the phrase on its own to trigger the action.
+# Format:  phrase = action      (lines starting with # are ignored)
+#
+# Available actions:
+#   newline  paragraph  send  enter  tab  escape  space  backspace
+#   undo  redo  selectall  copy  cut  paste  save
+#
+# Edit freely: add phrases, remap them, or delete ones you don't want.
+
+new line = newline
+line break = newline
+new paragraph = paragraph
+scratch that = undo
+delete that = undo
+send it = send
+press enter = send
+select all = selectall
+"""
 
 
-def match_voice_command(text):
-    """If the whole utterance is an editing command, return its action key."""
-    t = re.sub(r'[^\w\s]', '', text or '').strip().lower()
-    t = re.sub(r'\s+', ' ', t)
-    return VOICE_COMMANDS.get(t)
+def load_commands():
+    """Parse ~/.murmur/commands.txt into {normalized phrase: action}. Writes the
+    default file on first run. Unknown actions are skipped."""
+    if not COMMANDS_PATH.exists():
+        COMMANDS_PATH.write_text(DEFAULT_COMMANDS_TEXT, encoding='utf-8')
+    cmds = {}
+    for line in COMMANDS_PATH.read_text(encoding='utf-8').splitlines():
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        phrase, action = line.split('=', 1)
+        action = action.strip().lower()
+        phrase = re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', '', phrase).strip().lower())
+        if phrase and action in COMMAND_ACTIONS:
+            cmds[phrase] = action
+    return cmds
+
+
+def match_voice_command(text, commands):
+    """If the whole utterance is a command phrase, return its action key."""
+    t = re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', '', text or '').strip().lower())
+    return commands.get(t)
 
 
 def do_voice_command(action, controller):
-    def tap(key):
-        controller.press(key)
-        controller.release(key)
-    if action == 'newline':
-        tap(keyboard.Key.enter)
-    elif action == 'paragraph':
-        tap(keyboard.Key.enter)
-        tap(keyboard.Key.enter)
-    elif action == 'send':
-        tap(keyboard.Key.enter)
-    elif action == 'undo':
-        controller.press(keyboard.Key.ctrl)
-        tap('z')
-        controller.release(keyboard.Key.ctrl)
+    recipe = COMMAND_ACTIONS.get(action)
+    if not recipe:
+        return
+    if 'taps' in recipe:
+        for key in recipe['taps']:
+            controller.press(key)
+            controller.release(key)
+    elif 'chord' in recipe:
+        keys = recipe['chord']
+        for key in keys:
+            controller.press(key)
+        for key in reversed(keys):
+            controller.release(key)
 
 
 # Foreground app → cleanup tone. Light touch: casual for chat, clean for docs/email.
@@ -625,33 +669,98 @@ def tone_for_foreground():
     return TONE_RULES.get(label)
 
 
-_TONE_CACHE = {}
+_CUE_CACHE = {}
 CUE_SR = 44100
+CUSTOM_LABEL = 'Custom file…'
+
+# Built-in blip samples. Each has a higher 'start' and lower 'stop' pitch.
+CUE_PRESETS = {
+    'Soft sine': dict(start=587, stop=440, ms=150, shape='sine'),
+    'Blip':      dict(start=880, stop=620, ms=70,  shape='sine'),
+    'Marimba':   dict(start=659, stop=440, ms=240, shape='decay'),
+    'Chime':     dict(start=784, stop=523, ms=300, shape='chime'),
+    'Pop':       dict(start=1100, stop=760, ms=40, shape='sine'),
+}
 
 
-def _tone(freq, ms=150, volume=0.35, sr=CUE_SR):
-    """A soft sine blip (float32) with a raised-cosine (Hann) envelope so it fades
-    in and out with no click — gentler than winsound.Beep's square wave."""
-    key = (freq, ms, volume, sr)
-    if key not in _TONE_CACHE:
-        n = int(sr * ms / 1000)
-        t = np.arange(n) / sr
+def _synth(freq, ms, shape, sr=CUE_SR):
+    """Generate a unit-volume float32 blip of the given timbre."""
+    n = int(sr * ms / 1000)
+    t = np.arange(n) / sr
+    if shape == 'decay':          # quick attack, exponential decay — marimba-ish
+        sig = np.sin(2 * np.pi * freq * t) * np.exp(-t * 18.0)
+    elif shape == 'chime':        # a few harmonics with a longer decay
+        sig = (np.sin(2 * np.pi * freq * t)
+               + 0.5 * np.sin(2 * np.pi * freq * 2 * t)
+               + 0.25 * np.sin(2 * np.pi * freq * 3 * t)) / 1.75 * np.exp(-t * 8.0)
+    else:                         # sine with a clickless raised-cosine envelope
         env = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(n) / max(1, n - 1))
-        _TONE_CACHE[key] = (np.sin(2 * np.pi * freq * t) * env * volume).astype('float32')
-    return _TONE_CACHE[key]
+        sig = np.sin(2 * np.pi * freq * t) * env
+    return sig.astype('float32')
 
 
-def play_cue(kind, enabled=True):
+def _preset_sample(name, kind):
+    key = ('preset', name, kind)
+    if key not in _CUE_CACHE:
+        p = CUE_PRESETS.get(name, CUE_PRESETS['Soft sine'])
+        _CUE_CACHE[key] = (_synth(p['start'] if kind == 'start' else p['stop'],
+                                  p['ms'], p['shape']), CUE_SR)
+    return _CUE_CACHE[key]
+
+
+def _load_wav(path):
+    """Load a WAV file to a unit-peak float32 mono array + samplerate (cached)."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None, None
+    key = ('file', path, mtime)
+    if key not in _CUE_CACHE:
+        try:
+            import wave
+            with wave.open(path, 'rb') as w:
+                ch, sw, sr = w.getnchannels(), w.getsampwidth(), w.getframerate()
+                frames = w.readframes(w.getnframes())
+            if sw == 2:
+                a = np.frombuffer(frames, dtype='<i2').astype('float32') / 32768.0
+            elif sw == 1:
+                a = (np.frombuffer(frames, dtype=np.uint8).astype('float32') - 128) / 128.0
+            elif sw == 4:
+                a = np.frombuffer(frames, dtype='<i4').astype('float32') / 2147483648.0
+            else:
+                raise ValueError(f'unsupported sample width {sw}')
+            if ch > 1:
+                a = a.reshape(-1, ch).mean(axis=1)
+            peak = float(np.max(np.abs(a))) or 1.0
+            _CUE_CACHE[key] = ((a / peak * 0.9).astype('float32'), sr)
+        except Exception as e:
+            log(f'cue wav load failed: {e}')
+            _CUE_CACHE[key] = (None, None)
+    return _CUE_CACHE[key]
+
+
+def cue_sample(kind, sound, file):
+    if sound == CUSTOM_LABEL and file:
+        arr, sr = _load_wav(file)
+        if arr is not None:
+            return arr, sr  # else fall through to the default preset
+    return _preset_sample(sound if sound in CUE_PRESETS else 'Soft sine', kind)
+
+
+def play_cue(kind, volume=0.35, sound='Soft sine', file=''):
     """Soft, non-blocking activation blip through the default output device.
-    Uses sounddevice (same audio stack as recording) — winsound.PlaySound is
-    unreliable from the console-less pythonw process."""
-    if not enabled:
+    Uses sounddevice (same stack as recording); winsound is unreliable from
+    the console-less pythonw process."""
+    if volume <= 0:
         return
-    tone = _tone(587 if kind == 'start' else 440)  # D5 / A4 — mellow
+    arr, sr = cue_sample(kind, sound, file)
+    if arr is None:
+        return
+    data = (arr * float(volume)).astype('float32')
 
     def _play():
         try:
-            sd.play(tone, CUE_SR)
+            sd.play(data, sr)
         except Exception as e:
             log(f'cue play failed: {e}')
     threading.Thread(target=_play, daemon=True).start()
@@ -1077,9 +1186,7 @@ class Bubble:
     def _on_double_click(self, _ev):
         if self.dragging or not self.app:
             return
-        # Grow the settings window out of the visible pill (inset past the shadow pad).
-        rect = (self.win.winfo_x() + self.PAD, self.win.winfo_y() + self.PAD, self.W, self.H)
-        self.app.open_settings_from_bubble(rect)
+        self.app.open_settings_from_bubble()
 
     def _hide_forever(self):
         if self.app:
@@ -1273,6 +1380,7 @@ class MurmurApp:
                 ),
                 MenuItem('Settings', self._menu_settings),
                 MenuItem('Edit Dictionary', self._menu_dictionary),
+                MenuItem('Edit Commands', self._menu_commands),
                 MenuItem('Stats', self._menu_stats),
                 Menu.SEPARATOR,
                 MenuItem('Quit', self._menu_quit),
@@ -1345,7 +1453,10 @@ class MurmurApp:
             self.tk_root.after(0, self.bubble.show_idle)
 
     def _cue(self, kind):
-        play_cue(kind, self.cfg.get('sounds', True))
+        if not self.cfg.get('sounds', True):
+            return
+        play_cue(kind, self.cfg.get('cue_volume', 35) / 100.0,
+                 self.cfg.get('cue_sound', 'Soft sine'), self.cfg.get('cue_file', ''))
 
     def _ptt_chord_active(self):
         return bool(self.ptt_down) and all(self.ptt_down.values())
@@ -1489,7 +1600,7 @@ class MurmurApp:
         """If the utterance is an editing command, perform it and return True."""
         if not self.cfg.get('voice_commands', True):
             return False
-        action = match_voice_command(raw)
+        action = match_voice_command(raw, load_commands())
         if not action:
             return False
         log(f'voice command: {raw[:40]!r} -> {action}')
@@ -1571,10 +1682,10 @@ class MurmurApp:
     def _menu_toggle_startup(self, icon, item):
         set_startup(not startup_enabled())
 
-    def open_settings_from_bubble(self, rect):
-        """Double-click on the bubble — settings window expands out of it."""
+    def open_settings_from_bubble(self):
+        """Double-click on the bubble opens Settings."""
         from settings_ui import open_settings_window
-        open_settings_window(self.tk_root, self.cfg, self._on_settings_saved, origin=rect)
+        open_settings_window(self.tk_root, self.cfg, self._on_settings_saved)
 
     def _menu_settings(self, icon, item):
         from settings_ui import open_settings_window
@@ -1603,6 +1714,11 @@ class MurmurApp:
     def _menu_dictionary(self, icon, item):
         from settings_ui import open_dictionary_window
         self.tk_root.after(0, lambda: open_dictionary_window(self.tk_root, DICT_PATH))
+
+    def _menu_commands(self, icon, item):
+        from settings_ui import open_commands_window
+        load_commands()  # ensure the file exists before editing
+        self.tk_root.after(0, lambda: open_commands_window(self.tk_root, COMMANDS_PATH))
 
     def _menu_stats(self, icon, item):
         from settings_ui import open_stats_window
