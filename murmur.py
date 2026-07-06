@@ -45,7 +45,7 @@ import sounddevice as sd
 import pyperclip
 from pynput import keyboard
 from pystray import Icon, Menu, MenuItem
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageTk
 from faster_whisper import WhisperModel
 import tkinter as tk
 
@@ -533,7 +533,7 @@ class Bubble:
         self.root = root
         self.app = app
         self.W = 160
-        self.H = taskbar_height()  # match the Windows taskbar exactly
+        self.H = max(28, taskbar_height() - 8)  # a touch shorter than the taskbar
         self.win = None
         self.canvas = None
         self._levels = None
@@ -575,27 +575,51 @@ class Bubble:
         self.canvas.bind('<Double-Button-1>', self._on_double_click)
         self.canvas.bind('<ButtonPress-3>', lambda _e: self._hide_forever())
         self.win.withdraw()
+        self._assert_topmost()  # starts the keep-on-top watchdog loop
 
-    def _draw_pill(self):
-        """Capsule base: true semicircle end caps (ovals + rect for the fill,
-        arcs + lines for the border) — rounder than a smoothed polygon."""
-        c = self.canvas
-        c.delete('all')
-        x0, y0, x1, y1 = 1, 1, self.W - 2, self.H - 2
-        d = y1 - y0  # end-cap diameter = pill height
-        c.create_oval(x0, y0, x0 + d, y1, fill=self.PILL_BG, outline='')
-        c.create_oval(x1 - d, y0, x1, y1, fill=self.PILL_BG, outline='')
-        c.create_rectangle(x0 + d / 2, y0, x1 - d / 2, y1, fill=self.PILL_BG, outline='')
-        c.create_arc(x0, y0, x0 + d, y1, start=90, extent=180, style='arc', outline=self.PILL_EDGE)
-        c.create_arc(x1 - d, y0, x1, y1, start=270, extent=180, style='arc', outline=self.PILL_EDGE)
-        c.create_line(x0 + d / 2, y0, x1 - d / 2, y0, fill=self.PILL_EDGE)
-        c.create_line(x0 + d / 2, y1, x1 - d / 2, y1, fill=self.PILL_EDGE)
+    SS = 4  # supersample factor — render 4x with PIL, downscale for smooth edges
+
+    def _render(self, draw_content):
+        """Draw the capsule + content with PIL at 4x resolution and downsample.
+        Color-key transparency can't antialias, but supersampling blends the
+        edge pixels into a soft fringe so the pill no longer looks jagged."""
+        S = self.SS
+        img = Image.new('RGB', (self.W * S, self.H * S), self.KEY)
+        d = ImageDraw.Draw(img)
+        m = S  # 1 logical px margin
+        d.rounded_rectangle(
+            [m, m, self.W * S - m, self.H * S - m],
+            radius=(self.H * S - 2 * m) // 2,
+            fill=self.PILL_BG, outline=self.PILL_EDGE, width=S,
+        )
+        draw_content(d, S)
+        img = img.resize((self.W, self.H), Image.LANCZOS)
+        self._photo = ImageTk.PhotoImage(img)  # keep the ref or Tk drops the image
+        self.canvas.delete('all')
+        self.canvas.create_image(0, 0, anchor='nw', image=self._photo)
 
     def _bar_xs(self):
         pad = self.H / 2 + 6  # keep the bar strip clear of the round end caps
         span = self.W - 2 * pad
         step = span / (self.BARS - 1)
         return [pad + i * step for i in range(self.BARS)]
+
+    def _assert_topmost(self):
+        """Clicking the taskbar raises it above other topmost windows — periodically
+        push the pill back to the top of the topmost band so it never hides."""
+        if self.win is not None and self._mode is not None:
+            try:
+                import ctypes
+                hwnd = ctypes.windll.user32.GetParent(self.win.winfo_id()) or self.win.winfo_id()
+                HWND_TOPMOST = -1
+                SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
+                ctypes.windll.user32.SetWindowPos(
+                    hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE,
+                )
+            except Exception:
+                pass
+        self.root.after(1500, self._assert_topmost)
 
     def _anchor_xy(self, pos):
         self.win.update_idletasks()
@@ -691,11 +715,14 @@ class Bubble:
         self._stop_anim()
         self._mode = 'idle'
         self.win.attributes('-alpha', 0.65)
-        self._draw_pill()
-        mid = self.H / 2
-        for x in self._bar_xs():
-            self.canvas.create_oval(x - 1.6, mid - 1.6, x + 1.6, mid + 1.6,
-                                    fill='#5a5a5a', outline='')
+
+        def content(d, S):
+            mid = self.H * S / 2
+            r = 1.6 * S
+            for x in self._bar_xs():
+                cx = x * S
+                d.ellipse([cx - r, mid - r, cx + r, mid + r], fill='#5a5a5a')
+        self._render(content)
         self._place()
         self.win.deiconify()
         self.win.lift()
@@ -721,14 +748,17 @@ class Bubble:
         # Speech RMS is roughly 0.02–0.3; scale into 0..1 with a floor so the
         # bar strip stays visible (and clearly "waiting") during silence.
         self._levels.append(min(1.0, raw * 8.0))
-        self._draw_pill()
-        c = self.canvas
-        mid = self.H / 2
-        max_h = self.H - 14
-        for x, lv in zip(self._bar_xs(), self._levels):
-            h = max(3.0, lv * max_h)
-            c.create_rectangle(x - 1.8, mid - h / 2, x + 1.8, mid + h / 2,
-                               fill='#f2f2f2', outline='')
+
+        def content(d, S):
+            mid = self.H * S / 2
+            hw = 1.8 * S  # bar half-width; also the cap radius
+            max_h = self.H - 14
+            for x, lv in zip(self._bar_xs(), self._levels):
+                h = max(4.0, lv * max_h) * S  # min height ≥ bar width so caps fit
+                cx = x * S
+                d.rounded_rectangle([cx - hw, mid - h / 2, cx + hw, mid + h / 2],
+                                    radius=hw, fill='#f2f2f2')
+        self._render(content)
         self._anim_job = self.win.after(self.TICK_MS, self._tick)
 
     def show_processing(self):
@@ -748,13 +778,14 @@ class Bubble:
     def _tick_processing(self):
         if self._mode != 'proc':
             return
-        self._draw_pill()
-        c = self.canvas
-        cx, mid = self.W / 2, self.H / 2
-        for i in range(3):
-            s = 2.8 + 1.8 * max(0.0, math.sin((self._phase - i * 2) * 0.55))
-            x = cx + (i - 1) * 15
-            c.create_oval(x - s, mid - s, x + s, mid + s, fill='#ffd56b', outline='')
+
+        def content(d, S):
+            cx, mid = self.W * S / 2, self.H * S / 2
+            for i in range(3):
+                s = (2.8 + 1.8 * max(0.0, math.sin((self._phase - i * 2) * 0.55))) * S
+                x = cx + (i - 1) * 15 * S
+                d.ellipse([x - s, mid - s, x + s, mid + s], fill='#ffd56b')
+        self._render(content)
         self._phase += 1
         self._anim_job = self.win.after(80, self._tick_processing)
 
