@@ -104,6 +104,61 @@ KEY_GROUPS = {
     'shift': SHIFT_KEYS,
 }
 
+_MOD_ORDER = {'ctrl': 0, 'cmd': 1, 'alt': 2, 'shift': 3}
+_TOKEN_NAMES = {'ctrl': 'Ctrl', 'cmd': 'Win', 'alt': 'Alt', 'shift': 'Shift',
+                'space': 'Space', 'enter': 'Enter', 'tab': 'Tab', 'esc': 'Esc',
+                'backspace': 'Backspace', 'delete': 'Del', 'caps_lock': 'CapsLock'}
+
+
+def key_token(key):
+    """Canonical token for any pynput key: a modifier name ('ctrl','cmd','alt',
+    'shift'), a special-key name ('space','f13',...), or 'vk<code>' for a
+    character key. Lets any key combination be a hotkey, not just modifiers."""
+    if key in CTRL_KEYS:
+        return 'ctrl'
+    if key in WIN_KEYS:
+        return 'cmd'
+    if key in ALT_KEYS:
+        return 'alt'
+    if key in SHIFT_KEYS:
+        return 'shift'
+    if isinstance(key, keyboard.Key):
+        return key.name
+    vk = getattr(key, 'vk', None)
+    if vk:
+        return f'vk{vk}'          # stable across modifiers, unlike .char
+    ch = getattr(key, 'char', None)
+    return ch.lower() if ch else str(key)
+
+
+def token_label(tok):
+    """Human-readable name for a hotkey token."""
+    if tok in _TOKEN_NAMES:
+        return _TOKEN_NAMES[tok]
+    if tok.startswith('vk'):
+        try:
+            vk = int(tok[2:])
+        except ValueError:
+            return tok
+        if 65 <= vk <= 90 or 48 <= vk <= 57:
+            return chr(vk)                 # A-Z, 0-9
+        if 112 <= vk <= 123:
+            return f'F{vk - 111}'          # F1-F12
+        if 96 <= vk <= 105:
+            return f'Num{vk - 96}'
+        return f'VK{vk}'
+    if len(tok) > 1 and tok[0] == 'f' and tok[1:].isdigit():
+        return tok.upper()                 # f13 -> F13
+    return tok.upper() if len(tok) == 1 else tok.capitalize()
+
+
+def order_tokens(tokens):
+    return sorted(tokens, key=lambda t: (_MOD_ORDER.get(t, 9), t))
+
+
+def tokens_label(tokens):
+    return ' + '.join(token_label(t) for t in order_tokens(tokens)) if tokens else 'None'
+
 
 def load_config():
     if not CONFIG_PATH.exists():
@@ -1354,14 +1409,19 @@ class MurmurApp:
         self.bubble = Bubble(self.tk_root, self)
         self.tk_root.after(150, self.bubble.appear)  # persistent pill, fades in
 
-        # Two independent chords: push-to-talk (hold) and continuous (tap to toggle)
-        self.ptt_groups = self._parse_hotkey(self.cfg['hotkey'])
-        self.ptt_down = {name: False for name in self.ptt_groups}
+        # Two independent chords, each an arbitrary set of key tokens: push-to-talk
+        # (hold) and continuous (tap to toggle). _pressed tracks all held keys.
+        self.ptt_tokens = [t.lower() for t in (self.cfg.get('hotkey') or ['ctrl', 'cmd'])]
+        self.toggle_tokens = [t.lower() for t in (self.cfg.get('toggle_hotkey') or [])]
+        self._pressed = set()
         self._ptt_active = False
-        self.toggle_groups = self._parse_hotkey(self.cfg.get('toggle_hotkey', []), allow_empty=True)
-        self.toggle_down = {name: False for name in self.toggle_groups}
         self._toggle_was_active = False
         self.continuous = False
+        # Custom-hotkey recording
+        self._capturing = None
+        self._capture_pressed = set()
+        self._capture_max = set()
+        self._settings_win = None
 
         self.icon = Icon(
             'murmur',
@@ -1421,24 +1481,24 @@ class MurmurApp:
         if self.cfg.get('cleanup_backend', 'ollama') == 'ollama':
             self._set_cleanup_online(ensure_ollama_running(url))
 
-    def _parse_hotkey(self, spec, allow_empty=False):
-        if isinstance(spec, str):
-            spec = [spec]
-        groups = {}
-        for name in (spec or []):
-            name = name.lower().strip()
-            if name in KEY_GROUPS:
-                groups[name] = KEY_GROUPS[name]
-        if not groups and not allow_empty:
-            groups = {'ctrl': CTRL_KEYS, 'cmd': WIN_KEYS}
-        return groups
+    def _chord_active(self, tokens):
+        return bool(tokens) and set(tokens) <= self._pressed
 
-    @staticmethod
-    def _key_group(groups, key):
-        for name, group in groups.items():
-            if key in group:
-                return name
-        return None
+    def start_hotkey_capture(self, on_captured):
+        """Record the next key combination. on_captured(tokens|None) fires on the
+        tk thread (None = nothing captured / cancelled). Auto-cancels after 8s."""
+        self._capture_pressed = set()
+        self._capture_max = set()
+
+        def cb(combo):
+            self.tk_root.after(0, lambda: on_captured(combo))
+        self._capturing = cb
+
+        def timeout():
+            if self._capturing is cb:
+                self._capturing = None
+                self.tk_root.after(0, lambda: on_captured(None))
+        threading.Timer(8.0, timeout).start()
 
     def set_state(self, state):
         self.state = state
@@ -1458,32 +1518,30 @@ class MurmurApp:
         play_cue(kind, self.cfg.get('cue_volume', 35) / 100.0,
                  self.cfg.get('cue_sound', 'Soft sine'), self.cfg.get('cue_file', ''))
 
-    def _ptt_chord_active(self):
-        return bool(self.ptt_down) and all(self.ptt_down.values())
-
-    def _toggle_chord_active(self):
-        return bool(self.toggle_down) and all(self.toggle_down.values())
-
     def on_press(self, key):
-        pg = self._key_group(self.ptt_groups, key)
-        if pg:
-            self.ptt_down[pg] = True
-        tg = self._key_group(self.toggle_groups, key)
-        if tg:
-            self.toggle_down[tg] = True
+        tok = key_token(key)
+        self._pressed.add(tok)
+
+        # Recording a custom hotkey — swallow keys, track the largest chord seen.
+        if self._capturing is not None:
+            self._capture_pressed.add(tok)
+            if len(self._capture_pressed) > len(self._capture_max):
+                self._capture_max = set(self._capture_pressed)
+            return
 
         # Continuous mode: fire once on the rising edge of the toggle chord
-        if self.toggle_groups:
-            if self._toggle_chord_active():
+        if self.toggle_tokens:
+            if self._chord_active(self.toggle_tokens):
                 if not self._toggle_was_active:
                     self._toggle_was_active = True
                     self.toggle_continuous()
             else:
                 self._toggle_was_active = False
 
-        # Push-to-talk: start on chord down (ignored while continuous mode owns the mic)
-        if pg and not self.continuous and not self._toggle_chord_active() \
-                and self._ptt_chord_active() and self.state == 'idle':
+        # Push-to-talk: start on chord down (ignored while continuous owns the mic)
+        if (not self.continuous and self.state == 'idle'
+                and self._chord_active(self.ptt_tokens)
+                and not (self.toggle_tokens and self._chord_active(self.toggle_tokens))):
             self._ptt_active = True
             self.set_state('listening')
             self._cue('start')
@@ -1495,18 +1553,24 @@ class MurmurApp:
                 self.set_state('idle')
 
     def on_release(self, key):
-        pg = self._key_group(self.ptt_groups, key)
-        tg = self._key_group(self.toggle_groups, key)
-        ptt_was_active = self._ptt_chord_active()
-        if pg:
-            self.ptt_down[pg] = False
-        if tg:
-            self.toggle_down[tg] = False
-        if not self._toggle_chord_active():
+        tok = key_token(key)
+
+        if self._capturing is not None:
+            self._capture_pressed.discard(tok)
+            self._pressed.discard(tok)
+            if not self._capture_pressed and self._capture_max:
+                combo = order_tokens(self._capture_max)
+                cb, self._capturing, self._capture_max = self._capturing, None, set()
+                cb(None if combo == ['esc'] else combo)  # Esc alone = cancel
+            return
+
+        ptt_was_active = self._chord_active(self.ptt_tokens)
+        self._pressed.discard(tok)
+        if not self._chord_active(self.toggle_tokens):
             self._toggle_was_active = False
 
         # Push-to-talk: stop + process when the chord is released
-        if pg and self._ptt_active and ptt_was_active and not self.continuous:
+        if self._ptt_active and ptt_was_active and not self.continuous:
             self._ptt_active = False
             self._cue('stop')
             audio = self.recorder.stop()
@@ -1683,21 +1747,36 @@ class MurmurApp:
         set_startup(not startup_enabled())
 
     def open_settings_from_bubble(self):
-        """Double-click on the bubble opens Settings."""
-        from settings_ui import open_settings_window
-        open_settings_window(self.tk_root, self.cfg, self._on_settings_saved)
+        """Double-click on the bubble toggles Settings open/closed."""
+        self.open_settings(toggle=True)
 
     def _menu_settings(self, icon, item):
+        self.open_settings(toggle=False)
+
+    def open_settings(self, toggle=False):
+        self.tk_root.after(0, lambda: self._open_settings_ui(toggle))
+
+    def _open_settings_ui(self, toggle):
         from settings_ui import open_settings_window
-        self.tk_root.after(0, lambda: open_settings_window(self.tk_root, self.cfg, self._on_settings_saved))
+        w = self._settings_win
+        if w is not None and w.winfo_exists():
+            if toggle:
+                w.destroy()
+                self._settings_win = None
+            else:
+                w.deiconify()
+                w.lift()
+                w.focus_force()
+            return
+        self._settings_win = open_settings_window(
+            self.tk_root, self.cfg, self._on_settings_saved,
+            capture_hotkey=self.start_hotkey_capture)
 
     def _on_settings_saved(self, new_cfg):
         self.cfg = new_cfg
         save_config(new_cfg)
-        self.ptt_groups = self._parse_hotkey(new_cfg['hotkey'])
-        self.ptt_down = {name: False for name in self.ptt_groups}
-        self.toggle_groups = self._parse_hotkey(new_cfg.get('toggle_hotkey', []), allow_empty=True)
-        self.toggle_down = {name: False for name in self.toggle_groups}
+        self.ptt_tokens = [t.lower() for t in (new_cfg.get('hotkey') or ['ctrl', 'cmd'])]
+        self.toggle_tokens = [t.lower() for t in (new_cfg.get('toggle_hotkey') or [])]
         self._toggle_was_active = False
         if not self.continuous:  # don't yank the mic out from under a running session
             self.recorder = Recorder(new_cfg['sample_rate'], new_cfg['max_record_sec'])
@@ -1733,7 +1812,7 @@ class MurmurApp:
 
     def run(self):
         log(f'Murmur starting — claude_cli={CLAUDE_CLI}')
-        log(f'ptt={list(self.ptt_groups)}, toggle={list(self.toggle_groups)}, '
+        log(f'ptt={tokens_label(self.ptt_tokens)}, toggle={tokens_label(self.toggle_tokens)}, '
             f'model={self.cfg["model"]}, device={self.cfg["device"]}')
         listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release)
         listener.start()
