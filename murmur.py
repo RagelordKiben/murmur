@@ -558,21 +558,11 @@ class Bubble:
         self.win.attributes('-topmost', True)
         self.win.configure(bg=self.KEY)
         apply_no_activate(self.win)
-        # Per-pixel alpha via UpdateLayeredWindow — how Electron/Qt apps get
-        # smooth window edges. Requires WS_EX_LAYERED and NO Tk -alpha /
-        # -transparentcolor on this window (those use the older color-key API).
-        if sys.platform == 'win32':
-            try:
-                import ctypes
-                GWL_EXSTYLE = -20
-                WS_EX_LAYERED = 0x00080000
-                self.win.update_idletasks()
-                hwnd = ctypes.windll.user32.GetParent(self.win.winfo_id()) or self.win.winfo_id()
-                ex = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-                ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED)
-                self._layered = True
-            except Exception as e:
-                log(f'layered window setup failed, using color-key fallback: {e}')
+        # Per-pixel alpha via UpdateLayeredWindow — how Electron/Qt apps get smooth
+        # window edges. WS_EX_LAYERED is (re)applied per-frame in _push_frame rather
+        # than cached: Tk recreates the OS window when -topmost/overrideredirect/
+        # deiconify are applied, so any HWND captured here goes stale.
+        self._layered = (sys.platform == 'win32')
         self.canvas = tk.Canvas(
             self.win, width=self.W, height=self.H,
             bg=self.KEY, highlightthickness=0, cursor='hand2',
@@ -605,12 +595,16 @@ class Bubble:
         draw_content(d, S)
         img = img.resize((self.W, self.H), Image.LANCZOS)
         if self._layered:
+            ok = False
             try:
-                self._push_frame(img, opacity)
-                return
+                ok = self._push_frame(img, opacity)
             except Exception as e:
-                log(f'layered paint failed, using color-key fallback: {e}')
-                self._layered = False
+                log(f'layered paint raised, using color-key fallback: {e}')
+            if ok:
+                return
+            # ULW failed — never leave a solid-black layered window on screen.
+            log('layered paint failed; falling back to color-key rendering')
+            self._layered = False
         # Fallback (non-Windows or layered failure): color-key transparency
         try:
             self.win.attributes('-transparentcolor', self.KEY)
@@ -647,9 +641,28 @@ class Bubble:
             _fields_ = [('cx', ctypes.c_long), ('cy', ctypes.c_long)]
 
         user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
-        for fn in (user32.GetDC, gdi32.CreateCompatibleDC, gdi32.CreateDIBSection,
-                   gdi32.SelectObject):
-            fn.restype = ctypes.c_void_p  # handles are 64-bit; default c_int truncates
+        # HANDLE-returning calls must be c_void_p or the 64-bit value truncates.
+        user32.GetParent.restype = ctypes.c_void_p
+        user32.GetParent.argtypes = [ctypes.c_void_p]
+        user32.GetWindowLongW.restype = ctypes.c_long
+        user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.SetWindowLongW.restype = ctypes.c_long
+        user32.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+        user32.GetDC.restype = ctypes.c_void_p
+        gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+        gdi32.CreateDIBSection.restype = ctypes.c_void_p
+        gdi32.SelectObject.restype = ctypes.c_void_p
+        user32.UpdateLayeredWindow.restype = ctypes.c_int  # BOOL
+
+        # Fresh parent HWND each frame (the real TkTopLevel; winfo_id() is a
+        # non-composited TkChild) + (re)assert WS_EX_LAYERED right before the blit.
+        hwnd = user32.GetParent(self.win.winfo_id()) or self.win.winfo_id()
+        if not hwnd:
+            return False
+        GWL_EXSTYLE, WS_EX_LAYERED = -20, 0x00080000
+        ex = user32.GetWindowLongW(ctypes.c_void_p(hwnd), GWL_EXSTYLE)
+        if not (ex & WS_EX_LAYERED):
+            user32.SetWindowLongW(ctypes.c_void_p(hwnd), GWL_EXSTYLE, ex | WS_EX_LAYERED)
 
         w, h = img.size
         arr = np.asarray(img, dtype=np.uint8)
@@ -661,7 +674,6 @@ class Bubble:
         bgra[..., 3] = arr[..., 3]  # UpdateLayeredWindow wants premultiplied BGRA
         data = bgra.tobytes()
 
-        hwnd = user32.GetParent(ctypes.c_void_p(self.win.winfo_id())) or self.win.winfo_id()
         bmi = BITMAPINFOHEADER()
         bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
         bmi.biWidth, bmi.biHeight = w, -h  # negative = top-down rows
@@ -672,21 +684,29 @@ class Bubble:
         bits = ctypes.c_void_p()
         hbmp = gdi32.CreateDIBSection(ctypes.c_void_p(screen_dc), ctypes.byref(bmi),
                                       0, ctypes.byref(bits), None, 0)
+        ok = False
         try:
+            if not hbmp or not bits:
+                return False
             ctypes.memmove(bits, data, len(data))
             old = gdi32.SelectObject(ctypes.c_void_p(mem_dc), ctypes.c_void_p(hbmp))
             blend = BLENDFUNCTION(0, 0, int(opacity * 255), 1)  # AC_SRC_OVER / AC_SRC_ALPHA
             size, src = SIZE(w, h), POINT(0, 0)
             ULW_ALPHA = 2
-            user32.UpdateLayeredWindow(ctypes.c_void_p(hwnd), ctypes.c_void_p(screen_dc),
-                                       None, ctypes.byref(size),
-                                       ctypes.c_void_p(mem_dc), ctypes.byref(src),
-                                       0, ctypes.byref(blend), ULW_ALPHA)
+            res = user32.UpdateLayeredWindow(
+                ctypes.c_void_p(hwnd), ctypes.c_void_p(screen_dc),
+                None, ctypes.byref(size),
+                ctypes.c_void_p(mem_dc), ctypes.byref(src),
+                0, ctypes.byref(blend), ULW_ALPHA)
+            ok = bool(res)
+            if not ok:
+                log('UpdateLayeredWindow returned FALSE')
             gdi32.SelectObject(ctypes.c_void_p(mem_dc), ctypes.c_void_p(old))
         finally:
             gdi32.DeleteObject(ctypes.c_void_p(hbmp))
             gdi32.DeleteDC(ctypes.c_void_p(mem_dc))
             user32.ReleaseDC(None, ctypes.c_void_p(screen_dc))
+        return ok
 
     def _bar_xs(self):
         pad = self.H / 2 + 6  # keep the bar strip clear of the round end caps
@@ -700,12 +720,18 @@ class Bubble:
         if self.win is not None and self._mode is not None:
             try:
                 import ctypes
-                hwnd = ctypes.windll.user32.GetParent(self.win.winfo_id()) or self.win.winfo_id()
+                user32 = ctypes.windll.user32
+                user32.GetParent.restype = ctypes.c_void_p
+                user32.GetParent.argtypes = [ctypes.c_void_p]
+                user32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                                ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                                ctypes.c_int, ctypes.c_uint]
+                hwnd = user32.GetParent(self.win.winfo_id()) or self.win.winfo_id()
                 HWND_TOPMOST = -1
                 SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
-                ctypes.windll.user32.SetWindowPos(
-                    hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                    SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE,
+                user32.SetWindowPos(
+                    ctypes.c_void_p(hwnd), ctypes.c_void_p(HWND_TOPMOST & 0xFFFFFFFFFFFFFFFF),
+                    0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE,
                 )
             except Exception:
                 pass
@@ -737,6 +763,7 @@ class Bubble:
         else:
             x, y = self._anchor_xy(pos)
         self.win.geometry(f'{self.W}x{self.H}+{x}+{y}')
+        self.win.update_idletasks()  # ensure the OS window is sized before a layered blit
 
     def reposition(self):
         """Re-apply placement from config (e.g. after the position setting changes)."""
@@ -804,6 +831,9 @@ class Bubble:
         self._ensure()
         self._stop_anim()
         self._mode = 'idle'
+        self._place()
+        self.win.deiconify()
+        self.win.lift()
 
         def content(d, S):
             mid = self.H * S / 2
@@ -812,9 +842,6 @@ class Bubble:
                 cx = x * S
                 d.ellipse([cx - r, mid - r, cx + r, mid + r], fill='#5a5a5a')
         self._render(content, opacity=0.65)
-        self._place()
-        self.win.deiconify()
-        self.win.lift()
 
     def show_wave(self):
         """Animated waveform while recording — the 'it hears you' signal."""
