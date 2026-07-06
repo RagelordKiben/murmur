@@ -5,7 +5,6 @@ a local LLM (Ollama) cleans up filler/punctuation, text pastes into the
 focused field. Custom dictionary biases recognition + protects
 proper nouns during cleanup.
 """
-import io
 import json
 import math
 import os
@@ -15,7 +14,6 @@ import sys
 import time
 import threading
 import subprocess
-import wave
 from collections import deque
 from pathlib import Path
 
@@ -51,8 +49,6 @@ from pystray import Icon, Menu, MenuItem
 from PIL import Image, ImageDraw, ImageTk, ImageFilter
 from faster_whisper import WhisperModel
 import tkinter as tk
-if sys.platform == 'win32':
-    import winsound
 
 MURMUR_DIR = Path.home() / '.murmur'
 MURMUR_DIR.mkdir(exist_ok=True)
@@ -630,38 +626,34 @@ def tone_for_foreground():
 
 
 _TONE_CACHE = {}
+CUE_SR = 44100
 
 
-def _tone_wav(freq, ms=140, volume=0.22, sr=44100):
-    """A soft sine blip with a raised-cosine (Hann) envelope so it fades in and
-    out with no click — much gentler than winsound.Beep's square wave."""
-    key = (freq, ms, volume)
+def _tone(freq, ms=150, volume=0.35, sr=CUE_SR):
+    """A soft sine blip (float32) with a raised-cosine (Hann) envelope so it fades
+    in and out with no click — gentler than winsound.Beep's square wave."""
+    key = (freq, ms, volume, sr)
     if key not in _TONE_CACHE:
         n = int(sr * ms / 1000)
         t = np.arange(n) / sr
         env = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(n) / max(1, n - 1))
-        pcm = (np.sin(2 * np.pi * freq * t) * env * volume * 32767).astype('<i2').tobytes()
-        buf = io.BytesIO()
-        with wave.open(buf, 'wb') as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(sr)
-            w.writeframes(pcm)
-        _TONE_CACHE[key] = buf.getvalue()
+        _TONE_CACHE[key] = (np.sin(2 * np.pi * freq * t) * env * volume).astype('float32')
     return _TONE_CACHE[key]
 
 
 def play_cue(kind, enabled=True):
-    """Soft, non-blocking activation blip: gentle rise for start, lower for stop."""
-    if not enabled or sys.platform != 'win32':
+    """Soft, non-blocking activation blip through the default output device.
+    Uses sounddevice (same audio stack as recording) — winsound.PlaySound is
+    unreliable from the console-less pythonw process."""
+    if not enabled:
         return
-    data = _tone_wav(587 if kind == 'start' else 440)  # D5 / A4 — mellow, low volume
+    tone = _tone(587 if kind == 'start' else 440)  # D5 / A4 — mellow
 
     def _play():
         try:
-            winsound.PlaySound(data, winsound.SND_MEMORY | winsound.SND_ASYNC)
-        except Exception:
-            pass
+            sd.play(tone, CUE_SR)
+        except Exception as e:
+            log(f'cue play failed: {e}')
     threading.Thread(target=_play, daemon=True).start()
 
 
@@ -1067,7 +1059,7 @@ class Bubble:
         if self.dragging:
             nx = self.win_start[0] + dx
             ny = self.win_start[1] + dy
-            self.win.geometry(f'{self.W}x{self.H}+{nx}+{ny}')
+            self.win.geometry(f'{self.FW}x{self.FH}+{nx}+{ny}')  # full size incl. shadow pad
 
     def _on_release(self, _ev):
         if not self.dragging:
