@@ -477,6 +477,24 @@ def _safe_clip(value):
         pass
 
 
+def taskbar_height(default=48):
+    """Height of the Windows taskbar — the pill matches it exactly."""
+    if sys.platform != 'win32':
+        return default
+    try:
+        import ctypes
+        class RECT(ctypes.Structure):
+            _fields_ = [('l', ctypes.c_long), ('t', ctypes.c_long),
+                        ('r', ctypes.c_long), ('b', ctypes.c_long)]
+        rect = RECT()
+        ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0)  # SPI_GETWORKAREA
+        screen_h = ctypes.windll.user32.GetSystemMetrics(1)  # SM_CYSCREEN
+        h = screen_h - rect.b
+        return h if 20 <= h <= 90 else default  # sane range; taskbar may be hidden/side-docked
+    except Exception:
+        return default
+
+
 def apply_no_activate(win):
     """Keep a floating Tk window from stealing keyboard focus when clicked —
     paste must go to the window the user was typing in, not the overlay."""
@@ -504,9 +522,7 @@ class Bubble:
     Drag to move (position remembered). Double-click expands into the settings
     window. Right-click hides it (re-enable from the tray menu)."""
 
-    W = 124
-    H = 34
-    BARS = 13
+    BARS = 15
     TICK_MS = 50  # waveform refresh — one new bar every tick, scrolls right-to-left
     DRAG_THRESHOLD = 6  # pixels — moves above this trigger drag instead of click
     KEY = '#010203'  # transparency color key — anything this color is see-through
@@ -516,6 +532,8 @@ class Bubble:
     def __init__(self, root, app=None):
         self.root = root
         self.app = app
+        self.W = 160
+        self.H = taskbar_height()  # match the Windows taskbar exactly
         self.win = None
         self.canvas = None
         self._levels = None
@@ -559,19 +577,25 @@ class Bubble:
         self.win.withdraw()
 
     def _draw_pill(self):
-        """Capsule base: smooth rounded polygon on the transparent key color."""
+        """Capsule base: true semicircle end caps (ovals + rect for the fill,
+        arcs + lines for the border) — rounder than a smoothed polygon."""
         c = self.canvas
         c.delete('all')
         x0, y0, x1, y1 = 1, 1, self.W - 2, self.H - 2
-        r = (y1 - y0) / 2
-        pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1,
-               x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
-        c.create_polygon(pts, smooth=True, fill=self.PILL_BG, outline=self.PILL_EDGE)
+        d = y1 - y0  # end-cap diameter = pill height
+        c.create_oval(x0, y0, x0 + d, y1, fill=self.PILL_BG, outline='')
+        c.create_oval(x1 - d, y0, x1, y1, fill=self.PILL_BG, outline='')
+        c.create_rectangle(x0 + d / 2, y0, x1 - d / 2, y1, fill=self.PILL_BG, outline='')
+        c.create_arc(x0, y0, x0 + d, y1, start=90, extent=180, style='arc', outline=self.PILL_EDGE)
+        c.create_arc(x1 - d, y0, x1, y1, start=270, extent=180, style='arc', outline=self.PILL_EDGE)
+        c.create_line(x0 + d / 2, y0, x1 - d / 2, y0, fill=self.PILL_EDGE)
+        c.create_line(x0 + d / 2, y1, x1 - d / 2, y1, fill=self.PILL_EDGE)
 
     def _bar_xs(self):
-        span = self.W - 48  # bar strip, centered inside the capsule
+        pad = self.H / 2 + 6  # keep the bar strip clear of the round end caps
+        span = self.W - 2 * pad
         step = span / (self.BARS - 1)
-        return [24 + i * step for i in range(self.BARS)]
+        return [pad + i * step for i in range(self.BARS)]
 
     def _anchor_xy(self, pos):
         self.win.update_idletasks()
@@ -670,7 +694,7 @@ class Bubble:
         self._draw_pill()
         mid = self.H / 2
         for x in self._bar_xs():
-            self.canvas.create_oval(x - 1.4, mid - 1.4, x + 1.4, mid + 1.4,
+            self.canvas.create_oval(x - 1.6, mid - 1.6, x + 1.6, mid + 1.6,
                                     fill='#5a5a5a', outline='')
         self._place()
         self.win.deiconify()
@@ -700,10 +724,10 @@ class Bubble:
         self._draw_pill()
         c = self.canvas
         mid = self.H / 2
-        max_h = self.H - 12
+        max_h = self.H - 14
         for x, lv in zip(self._bar_xs(), self._levels):
-            h = max(2.8, lv * max_h)
-            c.create_rectangle(x - 1.6, mid - h / 2, x + 1.6, mid + h / 2,
+            h = max(3.0, lv * max_h)
+            c.create_rectangle(x - 1.8, mid - h / 2, x + 1.8, mid + h / 2,
                                fill='#f2f2f2', outline='')
         self._anim_job = self.win.after(self.TICK_MS, self._tick)
 
@@ -728,8 +752,8 @@ class Bubble:
         c = self.canvas
         cx, mid = self.W / 2, self.H / 2
         for i in range(3):
-            s = 2.4 + 1.6 * max(0.0, math.sin((self._phase - i * 2) * 0.55))
-            x = cx + (i - 1) * 13
+            s = 2.8 + 1.8 * max(0.0, math.sin((self._phase - i * 2) * 0.55))
+            x = cx + (i - 1) * 15
             c.create_oval(x - s, mid - s, x + s, mid + s, fill='#ffd56b', outline='')
         self._phase += 1
         self._anim_job = self.win.after(80, self._tick_processing)
