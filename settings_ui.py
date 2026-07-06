@@ -80,7 +80,7 @@ def _animate_expand(win, origin, final, steps=18, interval=10):
 def open_settings_window(root, cfg, on_save, origin=None):
     """origin: optional (x, y, w, h) rect to animate the window out of —
     used when opened by double-clicking the status bubble."""
-    WIN_W, WIN_H = 520, 760
+    WIN_W, WIN_H = 520, 830
     win = tk.Toplevel(root)
     win.title('Murmur —Settings')
     win.attributes('-topmost', True)
@@ -171,7 +171,18 @@ def open_settings_window(root, cfg, on_save, origin=None):
         ).grid(row=r, column=0, columnspan=2, sticky='w', **pad); r += 1
         return var
 
-    voice_cmd_var = _check('Voice commands ("new line", "scratch that", "send it")', 'voice_commands')
+    voice_cmd_var = _check('Voice commands (say one of these on its own):', 'voice_commands')
+    try:
+        from murmur import VOICE_COMMAND_HELP
+        cmd_lines = [f'{label} — {phrases}' for label, phrases, _ in VOICE_COMMAND_HELP]
+    except Exception:
+        cmd_lines = ['New line — "new line"', 'New paragraph — "new paragraph"',
+                     'Undo last — "scratch that"', 'Send — "send it"']
+    tk.Label(
+        win, text='\n'.join(cmd_lines), bg='#1e1e1e', fg='#8fb7dc',
+        font=('Segoe UI', 9), justify='left',
+    ).grid(row=r, column=0, columnspan=2, sticky='w', padx=(34, 14), pady=(0, 6)); r += 1
+
     tone_var = _check('Match tone to the app (casual in chat, clean in email/docs)', 'tone_matching')
     sounds_var = _check('Play start/stop sounds', 'sounds')
 

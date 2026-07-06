@@ -5,6 +5,7 @@ a local LLM (Ollama) cleans up filler/punctuation, text pastes into the
 focused field. Custom dictionary biases recognition + protects
 proper nouns during cleanup.
 """
+import io
 import json
 import math
 import os
@@ -14,6 +15,7 @@ import sys
 import time
 import threading
 import subprocess
+import wave
 from collections import deque
 from pathlib import Path
 
@@ -534,6 +536,14 @@ VOICE_COMMANDS = {
     'send it': 'send', 'send message': 'send', 'send that': 'send', 'press enter': 'send',
 }
 
+# Shown in Settings so the commands are easy to find. (label, spoken phrases, effect)
+VOICE_COMMAND_HELP = [
+    ('New line', '"new line", "line break"', 'inserts a line break'),
+    ('New paragraph', '"new paragraph"', 'inserts a blank line'),
+    ('Undo last', '"scratch that", "delete that"', 'presses Ctrl+Z'),
+    ('Send', '"send it", "press enter"', 'presses Enter'),
+]
+
 
 def match_voice_command(text):
     """If the whole utterance is an editing command, return its action key."""
@@ -619,17 +629,40 @@ def tone_for_foreground():
     return TONE_RULES.get(label)
 
 
+_TONE_CACHE = {}
+
+
+def _tone_wav(freq, ms=140, volume=0.22, sr=44100):
+    """A soft sine blip with a raised-cosine (Hann) envelope so it fades in and
+    out with no click — much gentler than winsound.Beep's square wave."""
+    key = (freq, ms, volume)
+    if key not in _TONE_CACHE:
+        n = int(sr * ms / 1000)
+        t = np.arange(n) / sr
+        env = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(n) / max(1, n - 1))
+        pcm = (np.sin(2 * np.pi * freq * t) * env * volume * 32767).astype('<i2').tobytes()
+        buf = io.BytesIO()
+        with wave.open(buf, 'wb') as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sr)
+            w.writeframes(pcm)
+        _TONE_CACHE[key] = buf.getvalue()
+    return _TONE_CACHE[key]
+
+
 def play_cue(kind, enabled=True):
-    """Short non-blocking beep: rising for start, falling for stop."""
+    """Soft, non-blocking activation blip: gentle rise for start, lower for stop."""
     if not enabled or sys.platform != 'win32':
         return
+    data = _tone_wav(587 if kind == 'start' else 440)  # D5 / A4 — mellow, low volume
 
-    def _beep():
+    def _play():
         try:
-            winsound.Beep(880 if kind == 'start' else 494, 80)
+            winsound.PlaySound(data, winsound.SND_MEMORY | winsound.SND_ASYNC)
         except Exception:
             pass
-    threading.Thread(target=_beep, daemon=True).start()
+    threading.Thread(target=_play, daemon=True).start()
 
 
 _last_paste_time = [0.0]
