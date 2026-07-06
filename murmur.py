@@ -1487,6 +1487,9 @@ class MurmurApp:
     def start_hotkey_capture(self, on_captured):
         """Record the next key combination. on_captured(tokens|None) fires on the
         tk thread (None = nothing captured / cancelled). Auto-cancels after 8s."""
+        if self._capturing is not None:      # a row was already recording — cancel it
+            prev, self._capturing = self._capturing, None
+            prev(None)
         self._capture_pressed = set()
         self._capture_max = set()
 

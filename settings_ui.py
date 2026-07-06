@@ -2,16 +2,6 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-# Continuous-mode toggle chord — includes an "Off" choice, and avoids reusing the
-# push-to-talk default so the two don't collide.
-TOGGLE_PRESETS = {
-    'Off (disabled)': [],
-    'Ctrl + Alt': ['ctrl', 'alt'],
-    'Ctrl + Shift': ['ctrl', 'shift'],
-    'Alt + Shift': ['alt', 'shift'],
-    'Ctrl + Win + Shift': ['ctrl', 'cmd', 'shift'],
-}
-
 MODEL_OPTIONS = ['tiny.en', 'base.en', 'small.en', 'medium.en', 'large-v3-turbo', 'large-v3']
 DEVICE_OPTIONS = ['cuda', 'cpu']
 # Whisper language: ISO code or 'auto' to detect per-utterance.
@@ -24,14 +14,6 @@ OLLAMA_MODEL_SUGGESTIONS = [
 CLAUDE_MODEL_OPTIONS = ['haiku', 'sonnet', 'opus']
 
 DARK = '#1e1e1e'
-
-
-def _match_preset(spec, presets):
-    spec_set = set(spec or [])
-    for label, preset in presets.items():
-        if set(preset) == spec_set:
-            return label
-    return list(presets.keys())[0]
 
 
 def open_settings_window(root, cfg, on_save, capture_hotkey=None):
@@ -64,37 +46,46 @@ def open_settings_window(root, cfg, on_save, capture_hotkey=None):
         ).grid(row=r, column=0, columnspan=2, sticky='w', **pad); r += 1
         return var
 
-    header('Hotkeys')
-    # Push-to-talk: record any key combination.
-    ptt_state = {'tokens': list(cfg.get('hotkey') or ['ctrl', 'cmd'])}
-    tk.Label(win, text='Push-to-talk (hold to dictate):', **label_args).grid(row=r, column=0, sticky='w', **pad)
-    ptt_frame = tk.Frame(win, bg=DARK)
-    ptt_frame.grid(row=r, column=1, sticky='w', padx=14, pady=4); r += 1
-    ptt_lbl = tk.Label(ptt_frame, text=tokens_label(ptt_state['tokens']), bg='#252525',
-                       fg='#8fb7dc', font=('Segoe UI', 10), width=20, anchor='w', padx=6, pady=2)
-    ptt_lbl.pack(side='left', padx=(0, 6))
+    def hotkey_row(text_, initial, allow_off):
+        """A "record any key combination" row. Returns {'tokens': [...]}."""
+        nonlocal r
+        state = {'tokens': list(initial or [])}
+        tk.Label(win, text=text_, **label_args).grid(row=r, column=0, sticky='w', **pad)
+        frame = tk.Frame(win, bg=DARK)
+        frame.grid(row=r, column=1, sticky='w', padx=14, pady=4); r += 1
+        lbl = tk.Label(frame, text=tokens_label(state['tokens']), bg='#252525', fg='#8fb7dc',
+                       font=('Segoe UI', 10), width=16, anchor='w', padx=6, pady=2)
+        lbl.pack(side='left', padx=(0, 6))
 
-    def record_ptt():
-        if not capture_hotkey:
-            return
-        rec_btn.config(text='Press keys…', state='disabled')
-        ptt_lbl.config(text='…')
-
-        def done(tokens):
-            if not rec_btn.winfo_exists():
+        def record():
+            if not capture_hotkey:
                 return
-            rec_btn.config(text='Record', state='normal')
-            if tokens:
-                ptt_state['tokens'] = tokens
-            ptt_lbl.config(text=tokens_label(ptt_state['tokens']))
-        capture_hotkey(done)
-    rec_btn = tk.Button(ptt_frame, text='Record', command=record_ptt, bg='#333', fg='#ddd',
-                        font=('Segoe UI', 9), relief='flat', padx=10, pady=2)
-    rec_btn.pack(side='left')
+            btn.config(text='Press keys…', state='disabled')
+            lbl.config(text='…')
 
-    tk.Label(win, text='Continuous transcription (tap to toggle):', **label_args).grid(row=r, column=0, sticky='w', **pad)
-    toggle_var = tk.StringVar(value=_match_preset(cfg.get('toggle_hotkey', []), TOGGLE_PRESETS))
-    ttk.Combobox(win, textvariable=toggle_var, values=list(TOGGLE_PRESETS.keys()), state='readonly', width=30).grid(row=r, column=1, **pad); r += 1
+            def done(tokens):
+                if not btn.winfo_exists():
+                    return
+                btn.config(text='Record', state='normal')
+                if tokens:
+                    state['tokens'] = tokens
+                lbl.config(text=tokens_label(state['tokens']))
+            capture_hotkey(done)
+        btn = tk.Button(frame, text='Record', command=record, bg='#333', fg='#ddd',
+                        font=('Segoe UI', 9), relief='flat', padx=10, pady=2)
+        btn.pack(side='left')
+
+        if allow_off:
+            def off():
+                state['tokens'] = []
+                lbl.config(text=tokens_label([]))
+            tk.Button(frame, text='Off', command=off, bg='#333', fg='#ddd',
+                      font=('Segoe UI', 9), relief='flat', padx=8, pady=2).pack(side='left', padx=(6, 0))
+        return state
+
+    header('Hotkeys')
+    ptt_state = hotkey_row('Push-to-talk (hold to dictate):', cfg.get('hotkey') or ['ctrl', 'cmd'], allow_off=False)
+    toggle_state = hotkey_row('Continuous transcription (tap to toggle):', cfg.get('toggle_hotkey') or [], allow_off=True)
 
     header('Transcription')
     tk.Label(win, text='Whisper model:', **label_args).grid(row=r, column=0, sticky='w', **pad)
@@ -219,8 +210,8 @@ def open_settings_window(root, cfg, on_save, capture_hotkey=None):
 
     def save():
         new_cfg = dict(cfg)
-        new_cfg['hotkey'] = ptt_state['tokens']
-        new_cfg['toggle_hotkey'] = TOGGLE_PRESETS[toggle_var.get()]
+        new_cfg['hotkey'] = ptt_state['tokens'] or ['ctrl', 'cmd']  # ptt never empty
+        new_cfg['toggle_hotkey'] = toggle_state['tokens']           # empty = disabled
         new_cfg['model'] = model_var.get()
         new_cfg['device'] = device_var.get()
         new_cfg['language'] = lang_var.get().strip() or 'en'
