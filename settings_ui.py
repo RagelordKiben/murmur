@@ -139,6 +139,15 @@ def open_settings_window(root, cfg, on_save, capture_hotkey=None):
               font=('Segoe UI', 9), relief='flat', padx=8, pady=2).grid(
         row=r, column=0, sticky='w', padx=(34, 14), pady=(0, 6)); r += 1
 
+    # Continuous mode: how long a pause ends a phrase. Higher = pauses within a
+    # sentence won't split it (but text appears a bit later).
+    tk.Label(win, text='Continuous mode — pause before ending a phrase:', **label_args).grid(
+        row=r, column=0, sticky='w', **pad)
+    pause_var = tk.DoubleVar(value=float(cfg.get('continuous_pause', 1.0)))
+    tk.Scale(win, from_=0.4, to=2.5, resolution=0.1, orient='horizontal', variable=pause_var,
+             bg=DARK, fg='#ddd', troughcolor='#333', highlightthickness=0,
+             length=200, showvalue=True).grid(row=r, column=1, sticky='w', **pad); r += 1
+
     tone_var = check('Match tone to the app (casual in chat, clean in email/docs)', 'tone_matching')
     sounds_var = check('Play start/stop sounds', 'sounds')
 
@@ -220,6 +229,7 @@ def open_settings_window(root, cfg, on_save, capture_hotkey=None):
         new_cfg['cleanup_backend'] = backend_var.get()
         new_cfg['cleanup_model'] = cm_var.get()
         new_cfg['voice_commands'] = voice_cmd_var.get()
+        new_cfg['continuous_pause'] = round(float(pause_var.get()), 1)
         new_cfg['tone_matching'] = tone_var.get()
         new_cfg['sounds'] = sounds_var.get()
         new_cfg['cue_sound'] = sound_var.get()

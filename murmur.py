@@ -80,6 +80,7 @@ DEFAULTS = {
     'sample_rate': 16000,
     'max_record_sec': 90,
     'voice_commands': True,   # spoken "new line", "scratch that", "send it", etc.
+    'continuous_pause': 1.0,  # continuous mode: seconds of silence that ends a phrase
     'tone_matching': True,    # nudge cleanup tone to match the foreground app
     'sounds': True,           # start/stop blips
     'cue_volume': 35,         # blip volume, 0-100
@@ -1604,17 +1605,24 @@ class MurmurApp:
 
     def _continuous_worker(self):
         """Segment the live mic stream on silence; transcribe+clean+paste each
-        segment as it completes, so text flows while you keep talking."""
+        segment as it completes, so text flows while you keep talking.
+
+        The silence hold is deliberately generous (configurable): short pauses
+        mid-sentence should NOT end a segment. Longer segments also punctuate
+        better, since cleanup decides sentence breaks from the words, not the
+        pauses — so a real sentence end inside a segment still gets a period."""
         sr = int(self.cfg['sample_rate'])
         SPEECH_RMS = 0.015     # above this = speech
-        SILENCE_HOLD = 0.6     # seconds of trailing silence that ends a segment
         MIN_SEG = 0.4          # ignore blips shorter than this
-        MAX_SEG = 20.0         # force-flush a very long run
+        MAX_SEG = 30.0         # force-flush a very long run
+        # seconds of trailing silence that ends a segment (read live from config)
+        silence_hold = float(self.cfg.get('continuous_pause', 1.0))
         idx = 0
         seg, seg_dur, sil_dur, speaking = [], 0.0, 0.0, False
         try:
             while self.continuous:
                 time.sleep(0.05)
+                silence_hold = float(self.cfg.get('continuous_pause', 1.0))
                 frames = self.recorder.frames
                 n = len(frames)
                 while idx < n:
@@ -1631,7 +1639,7 @@ class MurmurApp:
                         seg.append(chunk)
                         seg_dur += dur
                         sil_dur += dur
-                    if speaking and seg_dur >= MIN_SEG and (sil_dur >= SILENCE_HOLD or seg_dur >= MAX_SEG):
+                    if speaking and seg_dur >= MIN_SEG and (sil_dur >= silence_hold or seg_dur >= MAX_SEG):
                         audio = np.concatenate(seg, axis=0).flatten()
                         seg, seg_dur, sil_dur, speaking = [], 0.0, 0.0, False
                         self._process_segment(audio)
