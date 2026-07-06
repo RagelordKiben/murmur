@@ -80,7 +80,7 @@ def _animate_expand(win, origin, final, steps=18, interval=10):
 def open_settings_window(root, cfg, on_save, origin=None):
     """origin: optional (x, y, w, h) rect to animate the window out of —
     used when opened by double-clicking the status bubble."""
-    WIN_W, WIN_H = 520, 660
+    WIN_W, WIN_H = 520, 760
     win = tk.Toplevel(root)
     win.title('Murmur —Settings')
     win.attributes('-topmost', True)
@@ -159,6 +159,22 @@ def open_settings_window(root, cfg, on_save, origin=None):
     backend_var.trace_add('write', on_backend_change)
     on_backend_change()
 
+    tk.Label(win, text='Behavior', **head_args).grid(row=r, column=0, columnspan=2, sticky='w', padx=14, pady=(12, 2)); r += 1
+
+    def _check(text_, key, default=True):
+        nonlocal r
+        var = tk.BooleanVar(value=cfg.get(key, default))
+        tk.Checkbutton(
+            win, text=text_, variable=var,
+            bg='#1e1e1e', fg='#ddd', selectcolor='#1e1e1e',
+            activebackground='#1e1e1e', activeforeground='#fff', font=('Segoe UI', 10),
+        ).grid(row=r, column=0, columnspan=2, sticky='w', **pad); r += 1
+        return var
+
+    voice_cmd_var = _check('Voice commands ("new line", "scratch that", "send it")', 'voice_commands')
+    tone_var = _check('Match tone to the app (casual in chat, clean in email/docs)', 'tone_matching')
+    sounds_var = _check('Play start/stop sounds', 'sounds')
+
     tk.Label(win, text='Status bubble', **head_args).grid(row=r, column=0, columnspan=2, sticky='w', padx=14, pady=(12, 2)); r += 1
 
     bubble_visible_var = tk.BooleanVar(value=cfg.get('bubble_visible', True))
@@ -201,6 +217,9 @@ def open_settings_window(root, cfg, on_save, origin=None):
         new_cfg['cleanup_enabled'] = cleanup_var.get()
         new_cfg['cleanup_backend'] = backend_var.get()
         new_cfg['cleanup_model'] = cm_var.get()
+        new_cfg['voice_commands'] = voice_cmd_var.get()
+        new_cfg['tone_matching'] = tone_var.get()
+        new_cfg['sounds'] = sounds_var.get()
         new_cfg['bubble_visible'] = bubble_visible_var.get()
         new_cfg['bubble_position'] = label_to_pos.get(pos_var.get(), 'bottom-center')
         on_save(new_cfg)

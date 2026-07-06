@@ -8,6 +8,7 @@ proper nouns during cleanup.
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import time
@@ -45,9 +46,11 @@ import sounddevice as sd
 import pyperclip
 from pynput import keyboard
 from pystray import Icon, Menu, MenuItem
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageDraw, ImageTk, ImageFilter
 from faster_whisper import WhisperModel
 import tkinter as tk
+if sys.platform == 'win32':
+    import winsound
 
 MURMUR_DIR = Path.home() / '.murmur'
 MURMUR_DIR.mkdir(exist_ok=True)
@@ -77,6 +80,9 @@ DEFAULTS = {
     'ollama_url': 'http://localhost:11434',
     'sample_rate': 16000,
     'max_record_sec': 90,
+    'voice_commands': True,   # spoken "new line", "scratch that", "send it", etc.
+    'tone_matching': True,    # nudge cleanup tone to match the foreground app
+    'sounds': True,           # start/stop beeps
     'bubble_visible': True,
     'bubble_position': 'bottom-center',  # anchor, or 'custom' when dragged
     'bubble_x': None,     # remembered position when bubble_position == 'custom'
@@ -340,14 +346,23 @@ def _looks_like_refusal(out, original):
     return any(m in head and m not in orig for m in _REFUSAL_MARKERS)
 
 
-def clean_with_ollama(text, dictionary, model, url, lang='en'):
-    """Cleanup via local Ollama daemon — fast, free, offline, no quota impact."""
-    if not text.strip():
-        return text
-    import urllib.request
-    import urllib.error
+def _build_cleanup_prompt(text, dictionary, lang, tone):
     dict_str = ', '.join(dictionary) if dictionary else 'none'
     prompt = CLEANUP_PROMPTS.get(lang, CLEANUP_PROMPT).format(dictionary=dict_str, text=text)
+    if tone:  # inject a tone rule at the top of the RULES block (both languages have it)
+        prompt = prompt.replace('RULES:\n', f'RULES:\n- {tone}\n', 1)
+    return prompt
+
+
+def clean_with_ollama(text, dictionary, model, url, lang='en', tone=None):
+    """Cleanup via local Ollama daemon. Returns (text, backend_ok); backend_ok is
+    False when the daemon is unreachable (so the caller can flag 'cleanup offline'
+    instead of silently pasting the raw transcript)."""
+    if not text.strip():
+        return text, True
+    import urllib.request
+    import urllib.error
+    prompt = _build_cleanup_prompt(text, dictionary, lang, tone)
     payload = json.dumps({
         'model': model,
         'prompt': prompt,
@@ -376,14 +391,14 @@ def clean_with_ollama(text, dictionary, model, url, lang='en'):
                     out = out[len(prefix):].strip()
             if out and _looks_like_refusal(out, text):
                 log('cleanup model refused — pasting raw transcript instead')
-                return text
-            return out or text
+                return text, True
+            return (out or text), True
     except urllib.error.URLError as e:
         log(f'ollama URL error: {e}')
-        return text
+        return text, False  # daemon unreachable
     except Exception as e:
         log(f'ollama cleanup error: {e}')
-        return text
+        return text, True   # reachable but some other error — don't flag offline
 
 
 def find_claude_cli():
@@ -402,19 +417,85 @@ def find_claude_cli():
 CLAUDE_CLI = find_claude_cli()
 
 
-def clean_with_claude(text, dictionary, model='haiku', lang='en'):
-    """Cleanup via the Claude Code CLI on the user's Max plan.
+# --- Reliability: Ollama autostart + run-on-login ---------------------------
+
+OLLAMA_APP = Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'Ollama' / 'ollama app.exe'
+STARTUP_DIR = (Path(os.environ.get('APPDATA', '')) / 'Microsoft' / 'Windows'
+               / 'Start Menu' / 'Programs' / 'Startup')
+STARTUP_LNK = STARTUP_DIR / 'Murmur.lnk'
+
+
+def ollama_reachable(url, timeout=1.5):
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f'{url.rstrip("/")}/api/tags', timeout=timeout) as r:
+            return getattr(r, 'status', 200) == 200
+    except Exception:
+        return False
+
+
+def ensure_ollama_running(url, wait=12.0):
+    """Return True if Ollama answers; if not, try to launch the bundled app and
+    wait briefly for it to come up. Prevents silent raw-transcript fallback."""
+    if ollama_reachable(url):
+        return True
+    if sys.platform == 'win32' and OLLAMA_APP.exists():
+        try:
+            subprocess.Popen([str(OLLAMA_APP)], creationflags=CREATE_NO_WINDOW)
+            log('Ollama not reachable — launching it')
+        except Exception as e:
+            log(f'failed to launch Ollama: {e}')
+            return False
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            time.sleep(0.5)
+            if ollama_reachable(url):
+                log('Ollama is up')
+                return True
+    return ollama_reachable(url)
+
+
+def startup_enabled():
+    return STARTUP_LNK.exists()
+
+
+def set_startup(enable):
+    """Create/remove a Startup-folder shortcut so Murmur launches at login."""
+    if not enable:
+        try:
+            STARTUP_LNK.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log(f'failed to remove startup shortcut: {e}')
+        return
+    try:
+        pyw = str(Path(sys.executable).with_name('pythonw.exe'))
+        script = str(Path(__file__).resolve())
+        workdir = str(Path(__file__).resolve().parent)
+        ps = (
+            "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%s');"
+            "$s.TargetPath='%s';$s.Arguments='\"%s\"';"
+            "$s.WorkingDirectory='%s';$s.WindowStyle=7;$s.Save()"
+        ) % (STARTUP_LNK, pyw, script, workdir)
+        subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps],
+                       creationflags=CREATE_NO_WINDOW, timeout=15)
+    except Exception as e:
+        log(f'failed to create startup shortcut: {e}')
+
+
+def clean_with_claude(text, dictionary, model='haiku', lang='en', tone=None):
+    """Cleanup via the Claude Code CLI on the user's Max plan. Returns (text, ok).
 
     Strips API-key env vars before invoking so a stale key cannot route
     the call to the paid API — only the OAuth/Max session is used.
     """
     if not text.strip():
-        return text
+        return text, True
     if not CLAUDE_CLI:
         print('[murmur] claude.exe not found on PATH or ~/.local/bin — skipping cleanup', file=sys.stderr)
-        return text
-    dict_str = ', '.join(dictionary) if dictionary else 'none'
-    prompt = CLEANUP_PROMPTS.get(lang, CLEANUP_PROMPT).format(dictionary=dict_str, text=text)
+        return text, False
+    prompt = _build_cleanup_prompt(text, dictionary, lang, tone)
     env = os.environ.copy()
     for var in ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_API_KEY', 'CLAUDE_CODE_API_KEY'):
         env.pop(var, None)
@@ -435,13 +516,120 @@ def clean_with_claude(text, dictionary, model='haiku', lang='en'):
                 out = out[1:-1]
             if _looks_like_refusal(out, text):
                 log('cleanup model refused — pasting raw transcript instead')
-                return text
-            return out
+                return text, True
+            return out, True
         print(f'[murmur] cleanup non-zero exit {result.returncode}: {result.stderr}', file=sys.stderr)
-        return text
+        return text, False
     except Exception as e:
         print(f'[murmur] cleanup error: {e}', file=sys.stderr)
-        return text
+        return text, False
+
+
+# --- Voice commands, tone matching, sound cues ------------------------------
+
+VOICE_COMMANDS = {
+    'new line': 'newline', 'newline': 'newline', 'line break': 'newline',
+    'new paragraph': 'paragraph', 'paragraph break': 'paragraph',
+    'scratch that': 'undo', 'delete that': 'undo', 'undo that': 'undo', 'undo': 'undo',
+    'send it': 'send', 'send message': 'send', 'send that': 'send', 'press enter': 'send',
+}
+
+
+def match_voice_command(text):
+    """If the whole utterance is an editing command, return its action key."""
+    t = re.sub(r'[^\w\s]', '', text or '').strip().lower()
+    t = re.sub(r'\s+', ' ', t)
+    return VOICE_COMMANDS.get(t)
+
+
+def do_voice_command(action, controller):
+    def tap(key):
+        controller.press(key)
+        controller.release(key)
+    if action == 'newline':
+        tap(keyboard.Key.enter)
+    elif action == 'paragraph':
+        tap(keyboard.Key.enter)
+        tap(keyboard.Key.enter)
+    elif action == 'send':
+        tap(keyboard.Key.enter)
+    elif action == 'undo':
+        controller.press(keyboard.Key.ctrl)
+        tap('z')
+        controller.release(keyboard.Key.ctrl)
+
+
+# Foreground app → cleanup tone. Light touch: casual for chat, clean for docs/email.
+TONE_RULES = {
+    'casual': 'Keep the tone casual and conversational, exactly as spoken; do not formalize.',
+    'clean': 'Use clean grammar and professional wording, but never add or drop meaning.',
+}
+APP_TONE = {
+    'discord.exe': 'casual', 'slack.exe': 'casual', 'telegram.exe': 'casual',
+    'whatsapp.exe': 'casual', 'teams.exe': 'casual', 'ms-teams.exe': 'casual',
+    'outlook.exe': 'clean', 'winword.exe': 'clean', 'onenote.exe': 'clean',
+    'notion.exe': 'clean',
+}
+TITLE_TONE = [('gmail', 'clean'), ('outlook', 'clean'), ('docs.google', 'clean'),
+              ('- word', 'clean'), ('slack', 'casual'), ('discord', 'casual'),
+              ('messenger', 'casual'), ('whatsapp', 'casual')]
+
+
+def foreground_app():
+    """(exe_name_lower, window_title_lower) of the foreground window."""
+    if sys.platform != 'win32':
+        return ('', '')
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u, k = ctypes.windll.user32, ctypes.windll.kernel32
+        u.GetForegroundWindow.restype = ctypes.c_void_p
+        hwnd = u.GetForegroundWindow()
+        if not hwnd:
+            return ('', '')
+        pid = wintypes.DWORD()
+        u.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(pid))
+        n = u.GetWindowTextLengthW(ctypes.c_void_p(hwnd))
+        buf = ctypes.create_unicode_buffer(n + 1)
+        u.GetWindowTextW(ctypes.c_void_p(hwnd), buf, n + 1)
+        title = (buf.value or '').lower()
+        exe = ''
+        k.OpenProcess.restype = ctypes.c_void_p
+        h = k.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if h:
+            size = wintypes.DWORD(260)
+            pbuf = ctypes.create_unicode_buffer(260)
+            if k.QueryFullProcessImageNameW(ctypes.c_void_p(h), 0, pbuf, ctypes.byref(size)):
+                exe = Path(pbuf.value).name.lower()
+            k.CloseHandle(ctypes.c_void_p(h))
+        return (exe, title)
+    except Exception:
+        return ('', '')
+
+
+def tone_for_foreground():
+    """Return a tone instruction string for the current foreground app, or None."""
+    exe, title = foreground_app()
+    label = APP_TONE.get(exe)
+    if not label:
+        for kw, t in TITLE_TONE:
+            if kw in title:
+                label = t
+                break
+    return TONE_RULES.get(label)
+
+
+def play_cue(kind, enabled=True):
+    """Short non-blocking beep: rising for start, falling for stop."""
+    if not enabled or sys.platform != 'win32':
+        return
+
+    def _beep():
+        try:
+            winsound.Beep(880 if kind == 'start' else 494, 80)
+        except Exception:
+            pass
+    threading.Thread(target=_beep, daemon=True).start()
 
 
 _last_paste_time = [0.0]
@@ -528,6 +716,7 @@ class Bubble:
     KEY = '#010203'  # transparency color key — anything this color is see-through
     PILL_BG = '#1c1c1c'
     PILL_EDGE = '#3a3a3a'
+    PAD = 12  # transparent margin around the pill that holds the drop shadow
 
     def __init__(self, root, app=None):
         self.root = root
@@ -542,9 +731,20 @@ class Bubble:
         self._phase = 0
         self._layered = False
         self._photo = None
+        self._base = None          # cached shadow + pill body (constant per size)
+        self._last_img = None      # last full frame, for fade re-paints
+        self._base_opacity = 0.95
         self.dragging = False
         self.press_root = (0, 0)
         self.win_start = (0, 0)
+
+    @property
+    def FW(self):
+        return self.W + 2 * self.PAD
+
+    @property
+    def FH(self):
+        return self.H + 2 * self.PAD
 
     @property
     def enabled(self):
@@ -564,7 +764,7 @@ class Bubble:
         # deiconify are applied, so any HWND captured here goes stale.
         self._layered = (sys.platform == 'win32')
         self.canvas = tk.Canvas(
-            self.win, width=self.W, height=self.H,
+            self.win, width=self.FW, height=self.FH,
             bg=self.KEY, highlightthickness=0, cursor='hand2',
         )
         self.canvas.pack()
@@ -579,21 +779,45 @@ class Bubble:
 
     SS = 4  # supersample factor — render 4x with PIL, downscale for smooth curves
 
+    def _pill_base(self):
+        """Cached full-window frame: soft drop shadow + the capsule body. Constant
+        per size, so the blur is computed once and reused every animation frame."""
+        if self._base is not None:
+            return self._base
+        S, P, W, H = self.SS, self.PAD, self.W, self.H
+        big = Image.new('RGBA', (self.FW * S, self.FH * S), (0, 0, 0, 0))
+        # Drop shadow: the pill silhouette, nudged down, Gaussian-blurred.
+        shadow = Image.new('RGBA', (self.FW * S, self.FH * S), (0, 0, 0, 0))
+        ImageDraw.Draw(shadow).rounded_rectangle(
+            [P * S, (P + 3) * S, (P + W) * S, (P + H + 3) * S],
+            radius=(H * S) // 2, fill=(0, 0, 0, 150))
+        shadow = shadow.filter(ImageFilter.GaussianBlur(P * S * 0.5))
+        big.alpha_composite(shadow)
+        # Capsule body on top of the shadow.
+        m = S
+        ImageDraw.Draw(big).rounded_rectangle(
+            [P * S + m, P * S + m, (P + W) * S - m, (P + H) * S - m],
+            radius=(H * S - 2 * m) // 2,
+            fill=self.PILL_BG, outline=self.PILL_EDGE, width=S)
+        self._base = big.resize((self.FW, self.FH), Image.LANCZOS)
+        return self._base
+
     def _render(self, draw_content, opacity=0.95):
-        """Draw the capsule + content into an RGBA frame (4x supersampled) and
-        composite it with true per-pixel alpha. Edges blend against whatever is
-        behind the window — actually smooth, unlike color-key transparency."""
+        """Compose one frame: cached shadow+pill base, then the state content
+        (bars/dots) drawn 4x-supersampled in pill-local coords and pasted in."""
         S = self.SS
-        img = Image.new('RGBA', (self.W * S, self.H * S), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        m = S  # 1 logical px margin
-        d.rounded_rectangle(
-            [m, m, self.W * S - m, self.H * S - m],
-            radius=(self.H * S - 2 * m) // 2,
-            fill=self.PILL_BG, outline=self.PILL_EDGE, width=S,
-        )
-        draw_content(d, S)
-        img = img.resize((self.W, self.H), Image.LANCZOS)
+        frame = self._pill_base().copy()
+        content = Image.new('RGBA', (self.W * S, self.H * S), (0, 0, 0, 0))
+        draw_content(ImageDraw.Draw(content), S)
+        frame.alpha_composite(content.resize((self.W, self.H), Image.LANCZOS),
+                              (self.PAD, self.PAD))
+        self._last_img = frame
+        self._base_opacity = opacity
+        self._paint(frame, opacity)
+
+    def _paint(self, img, opacity):
+        """Push a composed RGBA frame to the window (per-pixel alpha, or color-key
+        fallback). Kept separate from _render so fades can re-push the same frame."""
         if self._layered:
             ok = False
             try:
@@ -616,6 +840,19 @@ class Bubble:
         self._photo = ImageTk.PhotoImage(flat)  # keep the ref or Tk drops the image
         self.canvas.delete('all')
         self.canvas.create_image(0, 0, anchor='nw', image=self._photo)
+
+    def _fade(self, frm, to, step=0, steps=7, done=None):
+        """Ramp window opacity by re-pushing the last frame at scaled alpha."""
+        if self._last_img is None:
+            if done:
+                done()
+            return
+        f = frm + (to - frm) * (step / steps)
+        self._paint(self._last_img, self._base_opacity * f)
+        if step < steps:
+            self.win.after(16, lambda: self._fade(frm, to, step + 1, steps, done))
+        elif done:
+            done()
 
     def _push_frame(self, img, opacity):
         """Blit an RGBA PIL frame onto this window via UpdateLayeredWindow —
@@ -738,6 +975,9 @@ class Bubble:
         self.root.after(1500, self._assert_topmost)
 
     def _anchor_xy(self, pos):
+        """Window (top-left) position for a named anchor. The window is PAD larger
+        than the pill on each side (shadow margin), so offset by -PAD to keep the
+        visible pill where the anchor intends."""
         self.win.update_idletasks()
         sw = self.win.winfo_screenwidth()
         sh = self.win.winfo_screenheight()
@@ -751,7 +991,8 @@ class Bubble:
             'top-right': (sw - self.W - m, top),
             'top-left': (m, top),
         }
-        return anchors.get(pos, anchors['bottom-center'])
+        px, py = anchors.get(pos, anchors['bottom-center'])
+        return px - self.PAD, py - self.PAD
 
     def _place(self):
         pos = self.app.cfg.get('bubble_position', 'bottom-center') if self.app else 'bottom-center'
@@ -762,7 +1003,7 @@ class Bubble:
                 x, y = self._anchor_xy('bottom-center')
         else:
             x, y = self._anchor_xy(pos)
-        self.win.geometry(f'{self.W}x{self.H}+{x}+{y}')
+        self.win.geometry(f'{self.FW}x{self.FH}+{x}+{y}')
         self.win.update_idletasks()  # ensure the OS window is sized before a layered blit
 
     def reposition(self):
@@ -811,20 +1052,21 @@ class Bubble:
     def _on_double_click(self, _ev):
         if self.dragging or not self.app:
             return
-        rect = (self.win.winfo_x(), self.win.winfo_y(),
-                self.win.winfo_width(), self.win.winfo_height())
+        # Grow the settings window out of the visible pill (inset past the shadow pad).
+        rect = (self.win.winfo_x() + self.PAD, self.win.winfo_y() + self.PAD, self.W, self.H)
         self.app.open_settings_from_bubble(rect)
 
     def _hide_forever(self):
         if self.app:
             self.app.cfg['bubble_visible'] = False
             save_config(self.app.cfg)
-        self.hide_window()
+        self.disappear()
 
     # --- states -----------------------------------------------------------
 
     def show_idle(self):
-        """Dim row of dots — 'Murmur is running, mic off'."""
+        """Dim row of dots — 'Murmur is running, mic off'. Dots turn amber when
+        the cleanup backend is offline (raw transcripts instead of cleaned)."""
         if not self.enabled:
             self.hide_window()
             return
@@ -834,14 +1076,34 @@ class Bubble:
         self._place()
         self.win.deiconify()
         self.win.lift()
+        offline = bool(self.app and not getattr(self.app, 'cleanup_online', True))
+        dot = '#d98a2b' if offline else '#5a5a5a'
 
         def content(d, S):
             mid = self.H * S / 2
             r = 1.6 * S
             for x in self._bar_xs():
                 cx = x * S
-                d.ellipse([cx - r, mid - r, cx + r, mid + r], fill='#5a5a5a')
-        self._render(content, opacity=0.65)
+                d.ellipse([cx - r, mid - r, cx + r, mid + r], fill=dot)
+        self._render(content, opacity=0.72 if offline else 0.65)
+
+    def appear(self):
+        """Show the pill with a soft fade-in (startup / re-enable)."""
+        if not self.enabled:
+            return
+        self.show_idle()
+        self._paint(self._last_img, 0.0)
+        self._fade(0.0, 1.0)
+
+    def disappear(self, done=None):
+        """Fade the pill out, then withdraw it."""
+        if self.win is None or self._last_img is None:
+            self.hide_window()
+            if done:
+                done()
+            return
+        self._stop_anim()
+        self._fade(1.0, 0.0, done=lambda: (self.hide_window(), done() if done else None))
 
     def show_wave(self):
         """Animated waveform while recording — the 'it hears you' signal."""
@@ -953,11 +1215,12 @@ class MurmurApp:
         self.transcriber = Transcriber(self.cfg)
         self.controller = keyboard.Controller()
         self.state = 'idle'
+        self.cleanup_online = True  # False when the cleanup backend is unreachable
 
         self.tk_root = tk.Tk()
         self.tk_root.withdraw()
         self.bubble = Bubble(self.tk_root, self)
-        self.tk_root.after(150, self.bubble.show_idle)  # persistent pill (no-op if hidden)
+        self.tk_root.after(150, self.bubble.appear)  # persistent pill, fades in
 
         # Two independent chords: push-to-talk (hold) and continuous (tap to toggle)
         self.ptt_groups = self._parse_hotkey(self.cfg['hotkey'])
@@ -978,6 +1241,11 @@ class MurmurApp:
                     self._menu_toggle_bubble,
                     checked=lambda _i: bool(self.cfg.get('bubble_visible', True)),
                 ),
+                MenuItem(
+                    'Start on Login',
+                    self._menu_toggle_startup,
+                    checked=lambda _i: startup_enabled(),
+                ),
                 MenuItem('Settings', self._menu_settings),
                 MenuItem('Edit Dictionary', self._menu_dictionary),
                 MenuItem('Stats', self._menu_stats),
@@ -994,17 +1262,31 @@ class MurmurApp:
             return
         if self.cfg.get('cleanup_backend', 'ollama') != 'ollama':
             return
+        url = self.cfg.get('ollama_url', 'http://localhost:11434')
         try:
+            self._set_cleanup_online(ensure_ollama_running(url))  # launch it if it's down
             t0 = time.time()
-            clean_with_ollama(
-                'hello world',
-                [],
-                self.cfg.get('cleanup_model', 'qwen2.5:7b'),
-                self.cfg.get('ollama_url', 'http://localhost:11434'),
-            )
-            log(f'ollama warmed in {time.time()-t0:.1f}s')
+            _, ok = clean_with_ollama('hello world', [],
+                                      self.cfg.get('cleanup_model', 'qwen2.5:7b'), url)
+            self._set_cleanup_online(ok)
+            log(f'ollama warmed in {time.time()-t0:.1f}s (online={ok})')
         except Exception as e:
             log(f'ollama warmup failed: {e}')
+
+    def _set_cleanup_online(self, ok):
+        """Track backend reachability; refresh the idle pill if the state flipped."""
+        ok = bool(ok)
+        if ok == self.cleanup_online:
+            return
+        self.cleanup_online = ok
+        if self.state == 'idle':
+            self.tk_root.after(0, self.bubble.show_idle)
+
+    def _recover_cleanup(self):
+        """Backend went offline mid-use — try to bring Ollama back in the background."""
+        url = self.cfg.get('ollama_url', 'http://localhost:11434')
+        if self.cfg.get('cleanup_backend', 'ollama') == 'ollama':
+            self._set_cleanup_online(ensure_ollama_running(url))
 
     def _parse_hotkey(self, spec, allow_empty=False):
         if isinstance(spec, str):
@@ -1037,6 +1319,9 @@ class MurmurApp:
         else:
             self.tk_root.after(0, self.bubble.show_idle)
 
+    def _cue(self, kind):
+        play_cue(kind, self.cfg.get('sounds', True))
+
     def _ptt_chord_active(self):
         return bool(self.ptt_down) and all(self.ptt_down.values())
 
@@ -1065,6 +1350,7 @@ class MurmurApp:
                 and self._ptt_chord_active() and self.state == 'idle':
             self._ptt_active = True
             self.set_state('listening')
+            self._cue('start')
             try:
                 self.recorder.start()
             except Exception as e:
@@ -1086,6 +1372,7 @@ class MurmurApp:
         # Push-to-talk: stop + process when the chord is released
         if pg and self._ptt_active and ptt_was_active and not self.continuous:
             self._ptt_active = False
+            self._cue('stop')
             audio = self.recorder.stop()
             self.set_state('processing')
             threading.Thread(target=self._process, args=(audio,), daemon=True).start()
@@ -1094,6 +1381,7 @@ class MurmurApp:
         """Tap the toggle hotkey to start/stop hands-free continuous dictation."""
         if self.continuous:
             log('continuous: stopping')
+            self._cue('stop')
             self.continuous = False  # worker flushes trailing audio, stops recorder, goes idle
             return
         if self.state != 'idle' or self._ptt_active:
@@ -1101,6 +1389,7 @@ class MurmurApp:
         log('continuous: starting')
         self.continuous = True
         self.set_state('listening')
+        self._cue('start')
         try:
             self.recorder.start()
         except Exception as e:
@@ -1155,6 +1444,33 @@ class MurmurApp:
             self.continuous = False
             self.set_state('idle')
 
+    def _cleanup(self, text, dictionary, lang):
+        """Run the configured cleanup backend, tracking reachability and applying
+        per-app tone. Returns the cleaned (or raw, if offline) text."""
+        backend = self.cfg.get('cleanup_backend', 'ollama')
+        model = self.cfg.get('cleanup_model', 'qwen2.5:7b')
+        tone = tone_for_foreground() if self.cfg.get('tone_matching', True) else None
+        if backend == 'claude':
+            out, ok = clean_with_claude(text, dictionary, model, lang, tone)
+        else:
+            out, ok = clean_with_ollama(text, dictionary, model,
+                                        self.cfg.get('ollama_url', 'http://localhost:11434'), lang, tone)
+        self._set_cleanup_online(ok)
+        if not ok:
+            threading.Thread(target=self._recover_cleanup, daemon=True).start()
+        return out
+
+    def _try_command(self, raw):
+        """If the utterance is an editing command, perform it and return True."""
+        if not self.cfg.get('voice_commands', True):
+            return False
+        action = match_voice_command(raw)
+        if not action:
+            return False
+        log(f'voice command: {raw[:40]!r} -> {action}')
+        do_voice_command(action, self.controller)
+        return True
+
     def _process_segment(self, audio):
         """Transcribe/clean/paste one continuous-mode segment. Keeps the UI in
         'listening' so the waveform stays live while the user keeps talking."""
@@ -1166,13 +1482,10 @@ class MurmurApp:
             log(f'continuous segment [{lang}]: {text[:100]!r}')
             if not text:
                 return
+            if self._try_command(text):
+                return
             if self.cfg.get('cleanup_enabled', True):
-                backend = self.cfg.get('cleanup_backend', 'ollama')
-                model = self.cfg.get('cleanup_model', 'qwen2.5:7b')
-                if backend == 'claude':
-                    text = clean_with_claude(text, dictionary, model, lang)
-                else:
-                    text = clean_with_ollama(text, dictionary, model, self.cfg.get('ollama_url', 'http://localhost:11434'), lang)
+                text = self._cleanup(text, dictionary, lang)
             if text:
                 paste_text(text, self.controller)
                 self._update_stats(text)
@@ -1194,15 +1507,14 @@ class MurmurApp:
             if not text:
                 self.set_state('idle')
                 return
+            if self._try_command(text):
+                self.set_state('success')
+                threading.Timer(0.4, lambda: self.set_state('idle')).start()
+                return
             if self.cfg.get('cleanup_enabled', True):
                 t0 = time.time()
-                backend = self.cfg.get('cleanup_backend', 'ollama')
-                model = self.cfg.get('cleanup_model', 'qwen2.5:7b')
-                log(f'cleanup via {backend}: {model}')
-                if backend == 'claude':
-                    text = clean_with_claude(text, dictionary, model, lang)
-                else:
-                    text = clean_with_ollama(text, dictionary, model, self.cfg.get('ollama_url', 'http://localhost:11434'), lang)
+                log(f'cleanup via {self.cfg.get("cleanup_backend", "ollama")}: {self.cfg.get("cleanup_model", "qwen2.5:7b")}')
+                text = self._cleanup(text, dictionary, lang)
                 log(f'cleaned in {time.time()-t0:.1f}s: {text[:120]!r}')
             log('pasting')
             paste_text(text, self.controller)
@@ -1227,9 +1539,12 @@ class MurmurApp:
         self.cfg['bubble_visible'] = not self.cfg.get('bubble_visible', True)
         save_config(self.cfg)
         if self.cfg['bubble_visible']:
-            self.tk_root.after(0, self.bubble.show_idle)
+            self.tk_root.after(0, self.bubble.appear)
         else:
-            self.tk_root.after(0, self.bubble.hide_window)
+            self.tk_root.after(0, self.bubble.disappear)
+
+    def _menu_toggle_startup(self, icon, item):
+        set_startup(not startup_enabled())
 
     def open_settings_from_bubble(self, rect):
         """Double-click on the bubble — settings window expands out of it."""
@@ -1253,7 +1568,7 @@ class MurmurApp:
         if new_cfg.get('bubble_visible', True):
             self.tk_root.after(0, self.bubble.show_idle)  # (re)show + apply new position
         else:
-            self.tk_root.after(0, self.bubble.hide_window)
+            self.tk_root.after(0, self.bubble.disappear)
         if new_cfg['model'] != self.transcriber.cfg.get('model'):
             self.transcriber = Transcriber(new_cfg)
             threading.Thread(target=self.transcriber.load, daemon=True).start()
