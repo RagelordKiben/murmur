@@ -1018,7 +1018,6 @@ class Bubble:
         self.canvas.bind('<B1-Motion>', self._on_move)
         self.canvas.bind('<ButtonRelease-1>', self._on_release)
         self.canvas.bind('<Double-Button-1>', self._on_double_click)
-        self.canvas.bind('<ButtonPress-3>', lambda _e: self._hide_forever())
         self.win.withdraw()
         self._assert_topmost()  # starts the keep-on-top watchdog loop
 
@@ -1298,12 +1297,6 @@ class Bubble:
         if self.dragging or not self.app:
             return
         self.app.open_settings_from_bubble()
-
-    def _hide_forever(self):
-        if self.app:
-            self.app.cfg['bubble_visible'] = False
-            save_config(self.app.cfg)
-        self.disappear()
 
     # --- states -----------------------------------------------------------
 
