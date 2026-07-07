@@ -20,12 +20,11 @@ def open_settings_window(root, cfg, on_save, capture_hotkey=None):
     """capture_hotkey(on_captured): start recording a custom key combination;
     on_captured(tokens|None) is called when done. Returns the created window."""
     from murmur import tokens_label
-    WIN_W, WIN_H = 520, 840
     win = tk.Toplevel(root)
     win.title('Murmur — Settings')
     win.attributes('-topmost', True)
     win.configure(bg=DARK)
-    win.geometry(f'{WIN_W}x{WIN_H}')
+    # geometry left unset — Tk auto-fits the window to its content
 
     label_args = {'bg': DARK, 'fg': '#ddd', 'font': ('Segoe UI', 10), 'anchor': 'w'}
     head_args = {'bg': DARK, 'fg': '#ffd56b', 'font': ('Segoe UI', 10, 'bold'), 'anchor': 'w'}
